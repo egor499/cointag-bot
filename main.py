@@ -34,10 +34,10 @@ COINS_PER_STAR = 100
 
 # Тарифы премиума (используются и для покупки себе, и для подарка другу за звёзды)
 PREMIUM_TARIFFS = {
-    "1d": {"title": "Премиум на 1 день", "stars": 15, "seconds": 86400},
-    "7d": {"title": "Премиум на 7 дней", "stars": 69, "seconds": 7 * 86400},
-    "30d": {"title": "Премиум на 30 дней", "stars": 149, "seconds": 30 * 86400},
-    "forever": {"title": "Премиум НАВСЕГДА (УЛЬТРА СКИДКА)", "stars": 219, "seconds": None},
+    "1d": {"title": "Премиум на 1 день", "stars": 3, "seconds": 86400},
+    "7d": {"title": "Премиум на 7 дней", "stars": 18, "seconds": 7 * 86400},
+    "30d": {"title": "Премиум на 30 дней", "stars": 55, "seconds": 30 * 86400},
+    "forever": {"title": "Премиум НАВСЕГДА (УЛЬТРА СКИДКА)", "stars": 149, "seconds": None},
 }
 
 # ТГ-подарки магазина вывода:
@@ -67,10 +67,15 @@ GIFT_COIN_AMOUNTS = [100, 500, 1500, 5000]
 BONUS_COINS = 25
 BONUS_COOLDOWN = 86400
 REF_BONUS_COINS = 15
+AUTO_REFRESH_INTERVAL = 60  # каждые 60 секунд
 
 # Временное состояние для выбора подарка / суммы / действий админа
 pending_gift_state: dict[int, dict] = {}
 pending_admin_action: dict[int, str] = {}
+
+# Кэш активного экрана пользователя:
+# user_id -> {"chat_id": int, "message_id": int, "screen": str}
+active_screen_cache: dict[int, dict] = {}
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -403,6 +408,154 @@ def gift_coins_amounts_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def cache_screen(user_id: int, chat_id: int, message_id: int, screen: str):
+    active_screen_cache[user_id] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "screen": screen,
+    }
+
+
+def clear_cached_screen(user_id: int):
+    active_screen_cache.pop(user_id, None)
+
+
+async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str, InlineKeyboardMarkup] | None:
+    user = await get_user(user_id)
+    if not user:
+        return None
+
+    if screen == "profile":
+        text = (
+            "👤 <b>Твой профиль</b>\n\n"
+            f"🆔 ID: <code>{user['user_id']}</code>\n"
+            f"🏅 Статус: <b>{format_premium_status(user)}</b>\n"
+            f"🪙 Баланс: <b>{user['coins']} КоинТэг</b>\n"
+            f"👥 Приглашено друзей: <b>{user['referrals_count']}</b>"
+        )
+        return text, back_menu_kb(user_id)
+
+    if screen == "ref":
+        bot_info = await bot.get_me()
+        ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+        text = (
+            "👥 <b>Реферальная система</b>\n\n"
+            f"За каждого нового друга ты получаешь <b>+{REF_BONUS_COINS} КоинТэг</b> (с PREMIUM — x2).\n"
+            f"Приглашено друзей: <b>{user['referrals_count']}</b>\n\n"
+            f"Твоя ссылка:\n{ref_link}"
+        )
+        return text, back_menu_kb(user_id)
+
+    if screen == "shop":
+        bot_info = await bot.get_me()
+        lines = [
+            "🛒 <b>Магазин ТГ-подарков</b>",
+            f"Твой баланс: <b>{user['coins']} КоинТэг</b>",
+            f"Курс вывода: <b>1 ★ = {COINS_PER_STAR} КоинТэг</b>\n",
+            "Доступные подарки к выводу:",
+        ]
+        for item in TG_GIFTS.values():
+            lines.append(f"• {item['emoji']} <b>{item['name']}</b> — <b>{item['coins']} КоинТэг</b> ({item['stars']} ★)")
+        return "\n".join(lines), shop_webapp_kb(user_id, user["coins"], bot_info.username or "LarplBot")
+
+    if screen == "premium":
+        text = (
+            "👑 <b>Премиум-статус</b>\n"
+            f"Текущий статус: <b>{format_premium_status(user)}</b>\n\n"
+            "Выбери тариф:"
+        )
+        return text, premium_menu_kb("buy_prem")
+
+    if screen == "vip":
+        if not is_premium_active(user):
+            return (
+                "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
+                main_menu_kb(user_id),
+            )
+        text = (
+            "⚡ <b>VIP-раздел</b>\n\n"
+            "Добро пожаловать в VIP! Здесь доступны эксклюзивные бонусы и привилегии для владельцев PREMIUM."
+        )
+        return text, back_menu_kb(user_id)
+
+    if screen == "gift":
+        text = (
+            "🎁 <b>Раздел «Подарок»</b>\n"
+            f"Твой текущий баланс: <b>{user['coins']} КоинТэг</b>\n\n"
+            "Что хочешь подарить пользователю из контактов?"
+        )
+        return text, gift_type_kb()
+
+    if screen == "admin":
+        if not is_admin(user_id):
+            return (
+                "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
+                main_menu_kb(user_id),
+            )
+        return "🛠 <b>Админ-панель</b>\n\nВыбери действие:", admin_panel_kb()
+
+    return (
+        "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
+        main_menu_kb(user_id),
+    )
+
+
+async def auto_rotate_screens_loop(bot: Bot):
+    """Каждую минуту удаляет старое сообщение из кэша, чистит кэш и отправляет новое в том же разделе."""
+    while True:
+        await asyncio.sleep(AUTO_REFRESH_INTERVAL)
+
+        now_ts = int(time.time())
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET premium_until = 0
+                    WHERE premium_forever = 0 AND premium_until > 0 AND premium_until <= ?
+                    """,
+                    (now_ts,),
+                )
+                await db.commit()
+        except Exception:
+            pass
+
+        snapshot = list(active_screen_cache.items())
+        for uid, entry in snapshot:
+            # Сразу удаляем старую запись из кэша, чтобы кэш не засорялся
+            clear_cached_screen(uid)
+
+            chat_id = entry.get("chat_id")
+            message_id = entry.get("message_id")
+            screen = entry.get("screen", "main")
+
+            if chat_id and message_id:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                except Exception:
+                    pass
+
+            if not chat_id:
+                continue
+
+            payload = await build_screen_payload(bot, uid, screen)
+            if not payload:
+                continue
+
+            text, kb = payload
+            try:
+                new_msg = await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+                cache_screen(uid, new_msg.chat.id, new_msg.message_id, screen)
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+
+
 async def push_update_to_all(bot: Bot) -> tuple[int, int]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
@@ -412,12 +565,13 @@ async def push_update_to_all(bot: Bot) -> tuple[int, int]:
     failed = 0
     for (uid,) in rows:
         try:
-            await bot.send_message(
+            msg = await bot.send_message(
                 uid,
                 "🔄 <b>Бот и магазин обновлены!</b>\nЗабирай бонус и заглядывай в <b>Магазин</b> 🛒",
                 reply_markup=main_menu_kb(uid),
                 parse_mode="HTML",
             )
+            cache_screen(uid, msg.chat.id, msg.message_id, "main")
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -495,9 +649,11 @@ async def show_profile(target: Message | CallbackQuery):
     )
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
+        cache_screen(user_id, target.message.chat.id, target.message.message_id, "profile")
         await target.answer()
     else:
-        await target.answer(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
+        sent = await target.answer(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
+        cache_screen(user_id, sent.chat.id, sent.message_id, "profile")
 
 
 async def open_shop_app(callback: CallbackQuery):
@@ -519,18 +675,21 @@ async def open_shop_app(callback: CallbackQuery):
         reply_markup=shop_webapp_kb(user_id, user["coins"], bot_info.username or "LarplBot"),
         parse_mode="HTML",
     )
+    cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "shop")
     await callback.answer()
 
 
 async def show_gift_menu(callback: CallbackQuery):
-    await ensure_user(callback.from_user.id, callback.from_user.username, callback.from_user.full_name)
-    user = await get_user(callback.from_user.id)
+    user_id = callback.from_user.id
+    await ensure_user(user_id, callback.from_user.username, callback.from_user.full_name)
+    user = await get_user(user_id)
     text = (
         "🎁 <b>Раздел «Подарок»</b>\n"
         f"Твой текущий баланс: <b>{user['coins']} КоинТэг</b>\n\n"
         "Что хочешь подарить пользователю из контактов?"
     )
     await callback.message.edit_text(text, reply_markup=gift_type_kb(), parse_mode="HTML")
+    cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "gift")
     await callback.answer()
 
 
@@ -612,10 +771,11 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
                 )
                 return
 
-    await message.answer(
+    sent_msg = await message.answer(
         "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
         reply_markup=main_menu_kb(message.from_user.id),
     )
+    cache_screen(message.from_user.id, sent_msg.chat.id, sent_msg.message_id, "main")
 
 
 async def handle_push_update_cmd(message: Message, bot: Bot):
@@ -640,6 +800,7 @@ async def handle_menu_callbacks(callback: CallbackQuery):
             "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
             reply_markup=main_menu_kb(user_id),
         )
+        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "main")
         await callback.answer()
         return
 
@@ -683,6 +844,7 @@ async def handle_menu_callbacks(callback: CallbackQuery):
             f"Твоя ссылка:\n{ref_link}"
         )
         await callback.message.edit_text(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
+        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "ref")
         await callback.answer()
         return
 
@@ -698,6 +860,7 @@ async def handle_menu_callbacks(callback: CallbackQuery):
             "Выбери тариф:"
         )
         await callback.message.edit_text(text, reply_markup=premium_menu_kb("buy_prem"), parse_mode="HTML")
+        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "premium")
         await callback.answer()
         return
 
@@ -711,6 +874,7 @@ async def handle_menu_callbacks(callback: CallbackQuery):
             "Добро пожаловать в VIP! Здесь доступны эксклюзивные бонусы и привилегии для владельцев PREMIUM."
         )
         await callback.message.edit_text(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
+        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "vip")
         await callback.answer()
         return
 
@@ -728,6 +892,7 @@ async def handle_menu_callbacks(callback: CallbackQuery):
             reply_markup=admin_panel_kb(),
             parse_mode="HTML",
         )
+        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "admin")
         await callback.answer()
         return
 
@@ -845,6 +1010,7 @@ async def handle_gift_coins_amount(callback: CallbackQuery, bot: Bot):
 
     ok, msg = await send_coins_gift(sender_id, recipient_id, amount, bot)
     await callback.message.edit_text(msg, reply_markup=main_menu_kb(sender_id), parse_mode="HTML")
+    cache_screen(sender_id, callback.message.chat.id, callback.message.message_id, "main")
     await callback.answer()
 
 
@@ -1032,10 +1198,11 @@ async def handle_text_messages(message: Message, bot: Bot):
         pending_gift_state.pop(message.from_user.id, None)
         pending_admin_action.pop(message.from_user.id, None)
         await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
-        await message.answer(
+        sent_msg = await message.answer(
             "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
             reply_markup=main_menu_kb(message.from_user.id),
         )
+        cache_screen(message.from_user.id, sent_msg.chat.id, sent_msg.message_id, "main")
         return
 
     if await handle_admin_text_input(message, bot):
@@ -1051,7 +1218,6 @@ async def main():
     dp.message.register(handle_push_update_cmd, Command("push_update"))
     dp.message.register(handle_webapp_data, F.web_app_data)
     dp.message.register(handle_users_shared, F.users_shared)
-    dp.message.register(handle_pre_checkout, PreCheckoutQuery)
     dp.message.register(handle_successful_payment, F.successful_payment)
 
     dp.callback_query.register(handle_menu_callbacks, F.data.startswith("menu:"))
@@ -1064,7 +1230,11 @@ async def main():
     dp.pre_checkout_query.register(handle_pre_checkout)
     dp.message.register(handle_text_messages, F.text)
 
-    await dp.start_polling(bot)
+    refresh_task = asyncio.create_task(auto_rotate_screens_loop(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        refresh_task.cancel()
 
 
 if __name__ == "__main__":
