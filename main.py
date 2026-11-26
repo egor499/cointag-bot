@@ -67,15 +67,15 @@ GIFT_COIN_AMOUNTS = [100, 500, 1500, 5000]
 BONUS_COINS = 25
 BONUS_COOLDOWN = 86400
 REF_BONUS_COINS = 15
-AUTO_REFRESH_INTERVAL = 60  # каждые 60 секунд
+AUTO_DELETE_SECONDS = 60
 
 # Временное состояние для выбора подарка / суммы / действий админа
 pending_gift_state: dict[int, dict] = {}
 pending_admin_action: dict[int, str] = {}
 
-# Кэш активного экрана пользователя:
-# user_id -> {"chat_id": int, "message_id": int, "screen": str}
+# Кэш активного экрана и активные таймеры автоудаления на пользователя
 active_screen_cache: dict[int, dict] = {}
+autodel_tasks: dict[int, asyncio.Task] = {}
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -210,6 +210,20 @@ async def get_user(user_id: int):
             return None
         cols = [col[0] for col in cursor.description]
         return dict(zip(cols, row))
+
+
+async def cleanup_expired_premiums_db():
+    now_ts = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE users
+            SET premium_until = 0
+            WHERE premium_forever = 0 AND premium_until > 0 AND premium_until <= ?
+            """,
+            (now_ts,),
+        )
+        await db.commit()
 
 
 async def add_coins(target_user_id: int, delta: int):
@@ -408,19 +422,15 @@ def gift_coins_amounts_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def cache_screen(user_id: int, chat_id: int, message_id: int, screen: str):
-    active_screen_cache[user_id] = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "screen": screen,
-    }
-
-
-def clear_cached_screen(user_id: int):
+def clear_user_cache_and_timer(user_id: int, cancel_task: bool = False):
     active_screen_cache.pop(user_id, None)
+    task = autodel_tasks.pop(user_id, None)
+    if cancel_task and task and not task.done():
+        task.cancel()
 
 
 async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str, InlineKeyboardMarkup] | None:
+    await cleanup_expired_premiums_db()
     user = await get_user(user_id)
     if not user:
         return None
@@ -500,60 +510,80 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
     )
 
 
-async def auto_rotate_screens_loop(bot: Bot):
-    """Каждую минуту удаляет старое сообщение из кэша, чистит кэш и отправляет новое в том же разделе."""
-    while True:
-        await asyncio.sleep(AUTO_REFRESH_INTERVAL)
+async def _autodel_worker(bot: Bot, user_id: int, chat_id: int, message_id: int, screen: str):
+    try:
+        await asyncio.sleep(AUTO_DELETE_SECONDS)
+    except asyncio.CancelledError:
+        return
 
-        now_ts = int(time.time())
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    """
-                    UPDATE users
-                    SET premium_until = 0
-                    WHERE premium_forever = 0 AND premium_until > 0 AND premium_until <= ?
-                    """,
-                    (now_ts,),
-                )
-                await db.commit()
-        except Exception:
-            pass
+    # Удаляем запись из кэша, чтобы кэш не засорялся
+    cached = active_screen_cache.get(user_id)
+    if cached and cached.get("message_id") == message_id:
+        active_screen_cache.pop(user_id, None)
+    if autodel_tasks.get(user_id) is asyncio.current_task():
+        autodel_tasks.pop(user_id, None)
 
-        snapshot = list(active_screen_cache.items())
-        for uid, entry in snapshot:
-            # Сразу удаляем старую запись из кэша, чтобы кэш не засорялся
-            clear_cached_screen(uid)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        print(f"[autodel] delete_message failed for user={user_id} msg={message_id}: {e}")
 
-            chat_id = entry.get("chat_id")
-            message_id = entry.get("message_id")
-            screen = entry.get("screen", "main")
+    payload = await build_screen_payload(bot, user_id, screen)
+    if not payload:
+        return
 
-            if chat_id and message_id:
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=message_id)
-                except Exception:
-                    pass
+    text, kb = payload
+    await send_screen_with_autodel(bot, user_id, chat_id, screen, text, kb)
 
-            if not chat_id:
-                continue
 
-            payload = await build_screen_payload(bot, uid, screen)
-            if not payload:
-                continue
+async def send_screen_with_autodel(
+    bot: Bot,
+    user_id: int,
+    chat_id: int,
+    screen: str,
+    text: str,
+    kb: InlineKeyboardMarkup,
+) -> Message:
+    # Отменяем старый таймер и чистим старый кэш перед отправкой нового экрана
+    clear_user_cache_and_timer(user_id, cancel_task=True)
 
-            text, kb = payload
-            try:
-                new_msg = await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=kb,
-                    parse_mode="HTML",
-                )
-                cache_screen(uid, new_msg.chat.id, new_msg.message_id, screen)
-                await asyncio.sleep(0.05)
-            except Exception:
-                pass
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    active_screen_cache[user_id] = {
+        "chat_id": msg.chat.id,
+        "message_id": msg.message_id,
+        "screen": screen,
+    }
+    autodel_tasks[user_id] = asyncio.create_task(
+        _autodel_worker(bot, user_id, msg.chat.id, msg.message_id, screen)
+    )
+    return msg
+
+
+async def replace_screen_on_callback(callback: CallbackQuery, screen: str, text: str, kb: InlineKeyboardMarkup):
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    old_msg_id = callback.message.message_id
+
+    clear_user_cache_and_timer(user_id, cancel_task=True)
+    try:
+        await bot_msg_delete_safe(callback.bot, chat_id, old_msg_id)
+    except Exception:
+        pass
+
+    await send_screen_with_autodel(callback.bot, user_id, chat_id, screen, text, kb)
+    await callback.answer()
+
+
+async def bot_msg_delete_safe(bot: Bot, chat_id: int, message_id: int):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        print(f"[autodel] instant delete failed chat={chat_id} msg={message_id}: {e}")
 
 
 async def push_update_to_all(bot: Bot) -> tuple[int, int]:
@@ -565,13 +595,14 @@ async def push_update_to_all(bot: Bot) -> tuple[int, int]:
     failed = 0
     for (uid,) in rows:
         try:
-            msg = await bot.send_message(
+            await send_screen_with_autodel(
+                bot,
                 uid,
+                uid,
+                "main",
                 "🔄 <b>Бот и магазин обновлены!</b>\nЗабирай бонус и заглядывай в <b>Магазин</b> 🛒",
-                reply_markup=main_menu_kb(uid),
-                parse_mode="HTML",
+                main_menu_kb(uid),
             )
-            cache_screen(uid, msg.chat.id, msg.message_id, "main")
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -639,58 +670,36 @@ async def process_gift_order(message: Message, item_key: str, bot: Bot):
 async def show_profile(target: Message | CallbackQuery):
     user_id = target.from_user.id
     await ensure_user(user_id, target.from_user.username, target.from_user.full_name)
-    user = await get_user(user_id)
-    text = (
-        "👤 <b>Твой профиль</b>\n\n"
-        f"🆔 ID: <code>{user['user_id']}</code>\n"
-        f"🏅 Статус: <b>{format_premium_status(user)}</b>\n"
-        f"🪙 Баланс: <b>{user['coins']} КоинТэг</b>\n"
-        f"👥 Приглашено друзей: <b>{user['referrals_count']}</b>"
-    )
+    payload = await build_screen_payload(target.bot, user_id, "profile")
+    if not payload:
+        return
+    text, kb = payload
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
-        cache_screen(user_id, target.message.chat.id, target.message.message_id, "profile")
-        await target.answer()
+        await replace_screen_on_callback(target, "profile", text, kb)
     else:
-        sent = await target.answer(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
-        cache_screen(user_id, sent.chat.id, sent.message_id, "profile")
+        await send_screen_with_autodel(target.bot, user_id, target.chat.id, "profile", text, kb)
 
 
 async def open_shop_app(callback: CallbackQuery):
     user_id = callback.from_user.id
     await ensure_user(user_id, callback.from_user.username, callback.from_user.full_name)
-    user = await get_user(user_id)
-    bot_info = await callback.bot.get_me()
-    lines = [
-        "🛒 <b>Магазин ТГ-подарков</b>",
-        f"Твой баланс: <b>{user['coins']} КоинТэг</b>",
-        f"Курс вывода: <b>1 ★ = {COINS_PER_STAR} КоинТэг</b>\n",
-        "Доступные подарки к выводу:",
-    ]
-    for item in TG_GIFTS.values():
-        lines.append(f"• {item['emoji']} <b>{item['name']}</b> — <b>{item['coins']} КоинТэг</b> ({item['stars']} ★)")
-
-    await callback.message.edit_text(
-        "\n".join(lines),
-        reply_markup=shop_webapp_kb(user_id, user["coins"], bot_info.username or "LarplBot"),
-        parse_mode="HTML",
-    )
-    cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "shop")
-    await callback.answer()
+    payload = await build_screen_payload(callback.bot, user_id, "shop")
+    if not payload:
+        await callback.answer()
+        return
+    text, kb = payload
+    await replace_screen_on_callback(callback, "shop", text, kb)
 
 
 async def show_gift_menu(callback: CallbackQuery):
     user_id = callback.from_user.id
     await ensure_user(user_id, callback.from_user.username, callback.from_user.full_name)
-    user = await get_user(user_id)
-    text = (
-        "🎁 <b>Раздел «Подарок»</b>\n"
-        f"Твой текущий баланс: <b>{user['coins']} КоинТэг</b>\n\n"
-        "Что хочешь подарить пользователю из контактов?"
-    )
-    await callback.message.edit_text(text, reply_markup=gift_type_kb(), parse_mode="HTML")
-    cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "gift")
-    await callback.answer()
+    payload = await build_screen_payload(callback.bot, user_id, "gift")
+    if not payload:
+        await callback.answer()
+        return
+    text, kb = payload
+    await replace_screen_on_callback(callback, "gift", text, kb)
 
 
 async def send_coins_gift(sender_id: int, recipient_id: int, amount: int, bot: Bot) -> tuple[bool, str]:
@@ -771,11 +780,14 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
                 )
                 return
 
-    sent_msg = await message.answer(
+    await send_screen_with_autodel(
+        bot,
+        message.from_user.id,
+        message.chat.id,
+        "main",
         "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-        reply_markup=main_menu_kb(message.from_user.id),
+        main_menu_kb(message.from_user.id),
     )
-    cache_screen(message.from_user.id, sent_msg.chat.id, sent_msg.message_id, "main")
 
 
 async def handle_push_update_cmd(message: Message, bot: Bot):
@@ -796,12 +808,12 @@ async def handle_menu_callbacks(callback: CallbackQuery):
 
     if action == "main":
         pending_admin_action.pop(user_id, None)
-        await callback.message.edit_text(
+        await replace_screen_on_callback(
+            callback,
+            "main",
             "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-            reply_markup=main_menu_kb(user_id),
+            main_menu_kb(user_id),
         )
-        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "main")
-        await callback.answer()
         return
 
     if action == "profile":
@@ -834,18 +846,11 @@ async def handle_menu_callbacks(callback: CallbackQuery):
         return
 
     if action == "ref":
-        user = await get_user(user_id)
-        bot_info = await callback.bot.get_me()
-        ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
-        text = (
-            "👥 <b>Реферальная система</b>\n\n"
-            f"За каждого нового друга ты получаешь <b>+{REF_BONUS_COINS} КоинТэг</b> (с PREMIUM — x2).\n"
-            f"Приглашено друзей: <b>{user['referrals_count']}</b>\n\n"
-            f"Твоя ссылка:\n{ref_link}"
-        )
-        await callback.message.edit_text(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
-        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "ref")
-        await callback.answer()
+        payload = await build_screen_payload(callback.bot, user_id, "ref")
+        if payload:
+            await replace_screen_on_callback(callback, "ref", payload[0], payload[1])
+        else:
+            await callback.answer()
         return
 
     if action == "shop":
@@ -853,15 +858,11 @@ async def handle_menu_callbacks(callback: CallbackQuery):
         return
 
     if action == "premium":
-        user = await get_user(user_id)
-        text = (
-            "👑 <b>Премиум-статус</b>\n"
-            f"Текущий статус: <b>{format_premium_status(user)}</b>\n\n"
-            "Выбери тариф:"
-        )
-        await callback.message.edit_text(text, reply_markup=premium_menu_kb("buy_prem"), parse_mode="HTML")
-        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "premium")
-        await callback.answer()
+        payload = await build_screen_payload(callback.bot, user_id, "premium")
+        if payload:
+            await replace_screen_on_callback(callback, "premium", payload[0], payload[1])
+        else:
+            await callback.answer()
         return
 
     if action == "vip":
@@ -869,13 +870,11 @@ async def handle_menu_callbacks(callback: CallbackQuery):
         if not is_premium_active(user):
             await callback.answer("🔒 Этот раздел доступен только владельцам 👑 PREMIUM!", show_alert=True)
             return
-        text = (
-            "⚡ <b>VIP-раздел</b>\n\n"
-            "Добро пожаловать в VIP! Здесь доступны эксклюзивные бонусы и привилегии для владельцев PREMIUM."
-        )
-        await callback.message.edit_text(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
-        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "vip")
-        await callback.answer()
+        payload = await build_screen_payload(callback.bot, user_id, "vip")
+        if payload:
+            await replace_screen_on_callback(callback, "vip", payload[0], payload[1])
+        else:
+            await callback.answer()
         return
 
     if action == "gift":
@@ -887,13 +886,12 @@ async def handle_menu_callbacks(callback: CallbackQuery):
             await callback.answer("Доступ запрещён.", show_alert=True)
             return
         pending_admin_action.pop(user_id, None)
-        await callback.message.edit_text(
+        await replace_screen_on_callback(
+            callback,
+            "admin",
             "🛠 <b>Админ-панель</b>\n\nВыбери действие:",
-            reply_markup=admin_panel_kb(),
-            parse_mode="HTML",
+            admin_panel_kb(),
         )
-        cache_screen(user_id, callback.message.chat.id, callback.message.message_id, "admin")
-        await callback.answer()
         return
 
 
@@ -1009,9 +1007,7 @@ async def handle_gift_coins_amount(callback: CallbackQuery, bot: Bot):
         return
 
     ok, msg = await send_coins_gift(sender_id, recipient_id, amount, bot)
-    await callback.message.edit_text(msg, reply_markup=main_menu_kb(sender_id), parse_mode="HTML")
-    cache_screen(sender_id, callback.message.chat.id, callback.message.message_id, "main")
-    await callback.answer()
+    await replace_screen_on_callback(callback, "main", msg, main_menu_kb(sender_id))
 
 
 async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery):
@@ -1198,11 +1194,14 @@ async def handle_text_messages(message: Message, bot: Bot):
         pending_gift_state.pop(message.from_user.id, None)
         pending_admin_action.pop(message.from_user.id, None)
         await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
-        sent_msg = await message.answer(
+        await send_screen_with_autodel(
+            bot,
+            message.from_user.id,
+            message.chat.id,
+            "main",
             "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-            reply_markup=main_menu_kb(message.from_user.id),
+            main_menu_kb(message.from_user.id),
         )
-        cache_screen(message.from_user.id, sent_msg.chat.id, sent_msg.message_id, "main")
         return
 
     if await handle_admin_text_input(message, bot):
@@ -1230,11 +1229,12 @@ async def main():
     dp.pre_checkout_query.register(handle_pre_checkout)
     dp.message.register(handle_text_messages, F.text)
 
-    refresh_task = asyncio.create_task(auto_rotate_screens_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
-        refresh_task.cancel()
+        for task in list(autodel_tasks.values()):
+            if not task.done():
+                task.cancel()
 
 
 if __name__ == "__main__":
