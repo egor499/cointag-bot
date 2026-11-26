@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, CommandObject
+from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -23,11 +23,10 @@ from aiogram.types import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-DB_PATH = "bot.db"
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
 # Ссылка на твоё веб-приложение (Mini App) магазина (обязательно https://)
-# Например: "https://egor499.github.io/cointag-shop/"
-SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://example.com/cointag-shop")
+SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
 
 # Курс: 1 звезда = 100 коинов
 COINS_PER_STAR = 100
@@ -68,8 +67,13 @@ BONUS_COINS = 25
 BONUS_COOLDOWN = 86400
 REF_BONUS_COINS = 15
 
-# Временное состояние для выбора подарка / суммы
+# Временное состояние для выбора подарка / суммы / действий админа
 pending_gift_state: dict[int, dict] = {}
+pending_admin_action: dict[int, str] = {}
+
+
+def is_admin(user_id: int | None) -> bool:
+    return bool(user_id is not None and int(user_id) == ADMIN_ID)
 
 
 def build_shop_webapp_url(user_id: int, coins: int) -> str:
@@ -98,6 +102,9 @@ def build_shop_webapp_url(user_id: int, coins: int) -> str:
 
 
 async def init_db():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -197,6 +204,25 @@ async def get_user(user_id: int):
         return dict(zip(cols, row))
 
 
+async def add_coins(target_user_id: int, delta: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT coins FROM users WHERE user_id = ?", (target_user_id,))
+        row = await cur.fetchone()
+        if not row:
+            initial = max(0, 10 + delta)
+            await db.execute(
+                "INSERT INTO users (user_id, coins) VALUES (?, ?)",
+                (target_user_id, initial),
+            )
+        else:
+            new_balance = max(0, (row[0] or 0) + delta)
+            await db.execute(
+                "UPDATE users SET coins = ? WHERE user_id = ?",
+                (new_balance, target_user_id),
+            )
+        await db.commit()
+
+
 def is_premium_active(user: dict) -> bool:
     if not user:
         return False
@@ -252,29 +278,46 @@ async def grant_premium(target_user_id: int, tariff_key: str):
         await db.commit()
 
 
-def main_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="👤 Профиль", callback_data="menu:profile"),
+            InlineKeyboardButton(text="🎁 Бонус", callback_data="menu:bonus"),
+        ],
+        [
+            InlineKeyboardButton(text="👥 Рефералка", callback_data="menu:ref"),
+            InlineKeyboardButton(text="🛒 Магазин", callback_data="menu:shop"),
+        ],
+        [
+            InlineKeyboardButton(text="👑 Премиум", callback_data="menu:premium"),
+            InlineKeyboardButton(text="⚡ VIP-раздел", callback_data="menu:vip"),
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Подарок", callback_data="menu:gift"),
+        ],
+    ]
+    if is_admin(user_id):
+        rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="👤 Профиль", callback_data="menu:profile"),
-                InlineKeyboardButton(text="🎁 Бонус", callback_data="menu:bonus"),
+                InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
+                InlineKeyboardButton(text="📣 Рассылка всем", callback_data="adm:broadcast"),
             ],
             [
-                InlineKeyboardButton(text="👥 Рефералка", callback_data="menu:ref"),
-                InlineKeyboardButton(text="🛒 Магазин", callback_data="menu:shop"),
+                InlineKeyboardButton(text="🪙 Выдать/снять коины", callback_data="adm:coins"),
+                InlineKeyboardButton(text="👑 Выдать Премиум 30д", callback_data="adm:prem30"),
             ],
-            [
-                InlineKeyboardButton(text="👑 Премиум", callback_data="menu:premium"),
-                InlineKeyboardButton(text="⚡ VIP-раздел", callback_data="menu:vip"),
-            ],
-            [
-                InlineKeyboardButton(text="🎁 Подарок", callback_data="menu:gift"),
-            ],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
         ]
     )
 
 
-def back_menu_kb() -> InlineKeyboardMarkup:
+def back_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]
@@ -357,6 +400,28 @@ def gift_coins_amounts_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def push_update_to_all(bot: Bot) -> tuple[int, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            rows = await cursor.fetchall()
+
+    sent = 0
+    failed = 0
+    for (uid,) in rows:
+        try:
+            await bot.send_message(
+                uid,
+                "🔄 <b>Бот и магазин обновлены!</b>\nЗабирай бонус и заглядывай в <b>Магазин</b> 🛒",
+                reply_markup=main_menu_kb(uid),
+                parse_mode="HTML",
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    return sent, failed
+
+
 async def show_profile(target: Message | CallbackQuery):
     user_id = target.from_user.id
     await ensure_user(user_id, target.from_user.username, target.from_user.full_name)
@@ -369,10 +434,10 @@ async def show_profile(target: Message | CallbackQuery):
         f"👥 Приглашено друзей: <b>{user['referrals_count']}</b>"
     )
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=back_menu_kb(), parse_mode="HTML")
+        await target.message.edit_text(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
         await target.answer()
     else:
-        await target.answer(text, reply_markup=back_menu_kb(), parse_mode="HTML")
+        await target.answer(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
 
 
 async def open_shop_app(callback: CallbackQuery):
@@ -464,7 +529,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
             recipient_id = int(parts[2])
             amount = int(parts[3])
             ok, msg = await send_coins_gift(message.from_user.id, recipient_id, amount, bot)
-            await message.answer(msg, reply_markup=main_menu_kb(), parse_mode="HTML")
+            await message.answer(msg, reply_markup=main_menu_kb(message.from_user.id), parse_mode="HTML")
             return
 
         if len(parts) >= 4 and parts[1] == "prem" and parts[2].isdigit():
@@ -483,7 +548,18 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
 
     await message.answer(
         "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(message.from_user.id),
+    )
+
+
+async def handle_push_update_cmd(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return
+    sent, failed = await push_update_to_all(bot)
+    await message.answer(
+        f"✅ Рассылка обновления завершена. Доставлено: <b>{sent}</b>, ошибок: <b>{failed}</b>",
+        reply_markup=admin_panel_kb(),
+        parse_mode="HTML",
     )
 
 
@@ -493,9 +569,10 @@ async def handle_menu_callbacks(callback: CallbackQuery):
     await ensure_user(user_id, callback.from_user.username, callback.from_user.full_name)
 
     if action == "main":
+        pending_admin_action.pop(user_id, None)
         await callback.message.edit_text(
             "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-            reply_markup=main_menu_kb(),
+            reply_markup=main_menu_kb(user_id),
         )
         await callback.answer()
         return
@@ -539,7 +616,7 @@ async def handle_menu_callbacks(callback: CallbackQuery):
             f"Приглашено друзей: <b>{user['referrals_count']}</b>\n\n"
             f"Твоя ссылка:\n{ref_link}"
         )
-        await callback.message.edit_text(text, reply_markup=back_menu_kb(), parse_mode="HTML")
+        await callback.message.edit_text(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
         await callback.answer()
         return
 
@@ -567,13 +644,152 @@ async def handle_menu_callbacks(callback: CallbackQuery):
             "⚡ <b>VIP-раздел</b>\n\n"
             "Добро пожаловать в VIP! Здесь доступны эксклюзивные бонусы и привилегии для владельцев PREMIUM."
         )
-        await callback.message.edit_text(text, reply_markup=back_menu_kb(), parse_mode="HTML")
+        await callback.message.edit_text(text, reply_markup=back_menu_kb(user_id), parse_mode="HTML")
         await callback.answer()
         return
 
     if action == "gift":
         await show_gift_menu(callback)
         return
+
+    if action == "admin":
+        if not is_admin(user_id):
+            await callback.answer("Доступ запрещён.", show_alert=True)
+            return
+        pending_admin_action.pop(user_id, None)
+        await callback.message.edit_text(
+            "🛠 <b>Админ-панель</b>\n\nВыбери действие:",
+            reply_markup=admin_panel_kb(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+
+async def handle_admin_callbacks(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+
+    sub = callback.data.split(":", 1)[1]
+    uid = callback.from_user.id
+
+    if sub == "stats":
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur_u = await db.execute("SELECT COUNT(*), COALESCE(SUM(coins), 0) FROM users")
+            users_cnt, total_coins = await cur_u.fetchone()
+            cur_o = await db.execute("SELECT COUNT(*) FROM shop_orders WHERE status = 'pending'")
+            (pending_orders,) = await cur_o.fetchone()
+
+        text = (
+            "📊 <b>Статистика бота</b>\n\n"
+            f"👥 Пользователей: <b>{users_cnt}</b>\n"
+            f"🪙 Всего КоинТэг на балансах: <b>{total_coins}</b>\n"
+            f"🛍 Заявок на вывод в ожидании: <b>{pending_orders}</b>"
+        )
+        await callback.message.edit_text(text, reply_markup=admin_panel_kb(), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if sub == "broadcast":
+        await callback.answer("Запускаю рассылку...", show_alert=False)
+        sent, failed = await push_update_to_all(bot)
+        await callback.message.answer(
+            f"✅ Рассылка завершена. Доставлено: <b>{sent}</b>, ошибок: <b>{failed}</b>",
+            reply_markup=admin_panel_kb(),
+            parse_mode="HTML",
+        )
+        return
+
+    if sub == "coins":
+        pending_admin_action[uid] = "coins"
+        await callback.message.edit_text(
+            "🪙 <b>Начисление / списание КоинТэг</b>\n\n"
+            "Отправь сообщение в формате:\n<code>USER_ID СУММА</code>\n"
+            "Например: <code>123456789 500</code> или <code>123456789 -200</code>",
+            reply_markup=admin_panel_kb(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    if sub == "prem30":
+        pending_admin_action[uid] = "prem30"
+        await callback.message.edit_text(
+            "👑 <b>Выдача Премиума на 30 дней</b>\n\n"
+            "Отправь <code>USER_ID</code> пользователя, которому нужно выдать тариф на 30 дней:",
+            reply_markup=admin_panel_kb(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+
+async def handle_admin_text_input(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return False
+
+    action = pending_admin_action.get(message.from_user.id)
+    if not action or not message.text:
+        return False
+
+    raw = message.text.strip()
+    pending_admin_action.pop(message.from_user.id, None)
+
+    if action == "coins":
+        parts = raw.split()
+        if len(parts) != 2 or not parts[1].lstrip("-").isdigit() or not parts[0].isdigit():
+            await message.answer(
+                "❌ Неверный формат. Нужно: <code>USER_ID СУММА</code>",
+                reply_markup=admin_panel_kb(),
+                parse_mode="HTML",
+            )
+            return True
+        target_id = int(parts[0])
+        delta = int(parts[1])
+        await add_coins(target_id, delta)
+        updated = await get_user(target_id)
+        await message.answer(
+            f"✅ Баланс <code>{target_id}</code> изменён на <b>{delta:+d}</b>. Текущий баланс: <b>{updated['coins']} КоинТэг</b>.",
+            reply_markup=admin_panel_kb(),
+            parse_mode="HTML",
+        )
+        try:
+            await bot.send_message(
+                target_id,
+                f"🪙 Администратор обновил твой баланс на <b>{delta:+d} КоинТэг</b>!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return True
+
+    if action == "prem30":
+        if not raw.isdigit():
+            await message.answer(
+                "❌ Нужно указать числовой <code>USER_ID</code>.",
+                reply_markup=admin_panel_kb(),
+                parse_mode="HTML",
+            )
+            return True
+        target_id = int(raw)
+        await grant_premium(target_id, "30d")
+        await message.answer(
+            f"✅ Пользователю <code>{target_id}</code> выдан <b>Премиум на 30 дней</b>.",
+            reply_markup=admin_panel_kb(),
+            parse_mode="HTML",
+        )
+        try:
+            await bot.send_message(
+                target_id,
+                "👑 Тебе выдан <b>Премиум на 30 дней</b>!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return True
+
+    return False
 
 
 async def handle_webapp_data(message: Message, bot: Bot):
@@ -582,13 +798,13 @@ async def handle_webapp_data(message: Message, bot: Bot):
     try:
         payload = json.loads(message.web_app_data.data)
     except Exception:
-        await message.answer("❌ Некорректные данные из приложения магазина.", reply_markup=main_menu_kb())
+        await message.answer("❌ Некорректные данные из приложения магазина.", reply_markup=main_menu_kb(message.from_user.id))
         return
 
     item_key = payload.get("item_id") or payload.get("item")
     item = TG_GIFTS.get(item_key)
     if not item:
-        await message.answer("❌ Выбран неизвестный ТГ-подарок.", reply_markup=main_menu_kb())
+        await message.answer("❌ Выбран неизвестный ТГ-подарок.", reply_markup=main_menu_kb(message.from_user.id))
         return
 
     user_id = message.from_user.id
@@ -599,7 +815,7 @@ async def handle_webapp_data(message: Message, bot: Bot):
         await message.answer(
             f"❌ Недостаточно КоинТэг для вывода <b>{item['emoji']} {item['name']}</b>!\n"
             f"Нужно: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★), у тебя: <b>{user['coins']} КоинТэг</b>.",
-            reply_markup=main_menu_kb(),
+            reply_markup=main_menu_kb(user_id),
             parse_mode="HTML",
         )
         return
@@ -610,7 +826,7 @@ async def handle_webapp_data(message: Message, bot: Bot):
             (item["coins"], user_id, item["coins"]),
         )
         if cur.rowcount == 0:
-            await message.answer("❌ Недостаточно КоинТэг!", reply_markup=main_menu_kb())
+            await message.answer("❌ Недостаточно КоинТэг!", reply_markup=main_menu_kb(user_id))
             return
         await db.execute(
             """
@@ -624,7 +840,7 @@ async def handle_webapp_data(message: Message, bot: Bot):
     await message.answer(
         f"✅ Заявка на вывод ТГ-подарка <b>{item['emoji']} {item['name']}</b> оформлена!\n"
         f"Списано: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★).",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(user_id),
         parse_mode="HTML",
     )
 
@@ -686,7 +902,7 @@ async def handle_users_shared(message: Message, bot: Bot):
         await message.answer(
             f"❌ Ошибка: выбранный пользователь (ID: <code>{recipient_id}</code>) не зарегистрирован в боте. "
             "Отправить КоинТэг можно только тем, кто уже заходил в бота.",
-            reply_markup=main_menu_kb(),
+            reply_markup=main_menu_kb(sender_id),
             parse_mode="HTML",
         )
         return
@@ -705,7 +921,7 @@ async def handle_users_shared(message: Message, bot: Bot):
         )
         await message.answer(
             f"Также при необходимости можно отправить ссылку получателю:\n<code>{gift_link}</code>",
-            reply_markup=back_menu_kb(),
+            reply_markup=back_menu_kb(sender_id),
             parse_mode="HTML",
         )
     else:
@@ -732,11 +948,11 @@ async def handle_gift_coins_amount(callback: CallbackQuery, bot: Bot):
     ok, msg = await send_coins_gift(sender_id, recipient_id, amount, bot)
 
     if not ok:
-        await callback.message.edit_text(msg, reply_markup=back_menu_kb(), parse_mode="HTML")
+        await callback.message.edit_text(msg, reply_markup=back_menu_kb(sender_id), parse_mode="HTML")
         await callback.answer("Ошибка отправки подарка", show_alert=True)
         return
 
-    await callback.message.edit_text(msg, reply_markup=back_menu_kb(), parse_mode="HTML")
+    await callback.message.edit_text(msg, reply_markup=back_menu_kb(sender_id), parse_mode="HTML")
     await callback.answer("Подарок отправлен!", show_alert=True)
 
 
@@ -787,7 +1003,7 @@ async def handle_successful_payment(message: Message, bot: Bot):
             await grant_premium(message.from_user.id, tariff_key)
             await message.answer(
                 f"👑 Оплата прошла! Тариф <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> активирован!",
-                reply_markup=main_menu_kb(),
+                reply_markup=main_menu_kb(message.from_user.id),
                 parse_mode="HTML",
             )
         return
@@ -799,7 +1015,7 @@ async def handle_successful_payment(message: Message, bot: Bot):
             await grant_premium(recipient_id, tariff_key)
             await message.answer(
                 f"🎁 Оплата прошла! Тариф <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> подарен пользователю <code>{recipient_id}</code>!",
-                reply_markup=main_menu_kb(),
+                reply_markup=main_menu_kb(message.from_user.id),
                 parse_mode="HTML",
             )
             try:
@@ -814,7 +1030,8 @@ async def handle_successful_payment(message: Message, bot: Bot):
 
 async def handle_cancel_reply(message: Message):
     pending_gift_state.pop(message.from_user.id, None)
-    await message.answer("Действие отменено.", reply_markup=main_menu_kb())
+    pending_admin_action.pop(message.from_user.id, None)
+    await message.answer("Действие отменено.", reply_markup=main_menu_kb(message.from_user.id))
 
 
 async def main():
@@ -823,12 +1040,19 @@ async def main():
     dp = Dispatcher()
 
     dp.message.register(handle_start, CommandStart())
+    dp.message.register(handle_push_update_cmd, Command("push_update"))
     dp.message.register(handle_cancel_reply, F.text == "❌ Отмена")
     dp.message.register(handle_users_shared, F.users_shared)
     dp.message.register(handle_webapp_data, F.web_app_data)
     dp.message.register(handle_successful_payment, F.successful_payment)
+    dp.message.register(
+        handle_admin_text_input,
+        F.from_user.id == ADMIN_ID,
+        F.text,
+    )
 
     dp.callback_query.register(handle_menu_callbacks, F.data.startswith("menu:"))
+    dp.callback_query.register(handle_admin_callbacks, F.data.startswith("adm:"))
     dp.callback_query.register(handle_gift_mode, F.data.startswith("gift_mode:"))
     dp.callback_query.register(handle_gift_coins_amount, F.data.startswith("gift_coins_amt:"))
     dp.callback_query.register(
