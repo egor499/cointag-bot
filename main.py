@@ -30,7 +30,7 @@ DB_PATH = os.environ.get("DB_PATH", "bot.db")
 SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
 
 # Курс: 1 звезда = 100 коинов
-COINS_PER_STAR = 100
+COINS_PER_STAR = 25
 
 # Тарифы премиума (используются и для покупки себе, и для подарка другу за звёзды)
 PREMIUM_TARIFFS = {
@@ -64,7 +64,7 @@ TG_GIFTS = {
 }
 
 GIFT_COIN_AMOUNTS = [100, 500, 1500, 5000]
-BONUS_COINS = 25
+BONUS_COINS = 5
 BONUS_COOLDOWN = 86400
 REF_BONUS_COINS = 15
 AUTO_DELETE_SECONDS = 60
