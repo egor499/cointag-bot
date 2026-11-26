@@ -14,6 +14,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     KeyboardButton,
     KeyboardButtonRequestUsers,
     WebAppInfo,
@@ -40,25 +41,25 @@ PREMIUM_TARIFFS = {
 }
 
 # ТГ-подарки магазина вывода:
-# 1 зв = 100 коинов -> мишка (15 зв = 1500), сердечко (25 зв = 2500), колечко (100 зв = 10000)
+# мишка = 300 коинов (15 зв), сердечко = 500 коинов (25 зв), колечко = 1500 коинов (100 зв)
 TG_GIFTS = {
     "bear": {
         "name": "Мишка",
         "emoji": "🧸",
         "stars": 15,
-        "coins": 15 * COINS_PER_STAR,
+        "coins": 300,
     },
     "heart": {
         "name": "Сердечко",
         "emoji": "💖",
         "stars": 25,
-        "coins": 25 * COINS_PER_STAR,
+        "coins": 500,
     },
     "ring": {
         "name": "Колечко",
         "emoji": "💍",
         "stars": 100,
-        "coins": 100 * COINS_PER_STAR,
+        "coins": 1500,
     },
 }
 
@@ -790,7 +791,105 @@ async def handle_admin_callbacks(callback: CallbackQuery, bot: Bot):
         return
 
 
-async def handle_admin_text_input(message: Message, bot: Bot):
+async def handle_buy_prem(callback: CallbackQuery):
+    tariff_key = callback.data.split(":", 1)[1]
+    tariff = PREMIUM_TARIFFS.get(tariff_key)
+    if not tariff:
+        await callback.answer("Тариф не найден.", show_alert=True)
+        return
+
+    await callback.message.answer_invoice(
+        title=tariff["title"],
+        description=f"Активация статуса «{tariff['title']}» в CoinTag",
+        payload=f"buy_prem:{tariff_key}",
+        currency="XTR",
+        prices=[LabeledPrice(label=tariff["title"], amount=tariff["stars"])],
+    )
+    await callback.answer()
+
+
+async def handle_gift_prem_tariff(callback: CallbackQuery):
+    tariff_key = callback.data.split(":", 1)[1]
+    tariff = PREMIUM_TARIFFS.get(tariff_key)
+    state = pending_gift_state.get(callback.from_user.id)
+    recipient_id = state.get("recipient_id") if state else None
+
+    if not tariff or not recipient_id:
+        await callback.answer("Сначала выбери получателя подарка.", show_alert=True)
+        return
+
+    await callback.message.answer_invoice(
+        title=f"Подарок: {tariff['title']}",
+        description=f"Подарок «{tariff['title']}» для пользователя ID {recipient_id}",
+        payload=f"gift_prem:{recipient_id}:{tariff_key}",
+        currency="XTR",
+        prices=[LabeledPrice(label=tariff["title"], amount=tariff["stars"])],
+    )
+    await callback.answer()
+
+
+async def handle_gift_coins_amount(callback: CallbackQuery, bot: Bot):
+    amt_str = callback.data.split(":", 1)[1]
+    if not amt_str.isdigit():
+        await callback.answer("Некорректная сумма.", show_alert=True)
+        return
+
+    amount = int(amt_str)
+    sender_id = callback.from_user.id
+    state = pending_gift_state.pop(sender_id, None)
+    recipient_id = state.get("recipient_id") if state else None
+
+    if not recipient_id:
+        await callback.answer("Получатель не выбран. Начни заново через «Подарок».", show_alert=True)
+        return
+
+    ok, msg = await send_coins_gift(sender_id, recipient_id, amount, bot)
+    await callback.message.edit_text(msg, reply_markup=main_menu_kb(sender_id), parse_mode="HTML")
+    await callback.answer()
+
+
+async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await pre_checkout_query.answer(ok=True)
+
+
+async def handle_successful_payment(message: Message, bot: Bot):
+    sp = message.successful_payment
+    if not sp:
+        return
+
+    payload = sp.invoice_payload or ""
+    parts = payload.split(":")
+
+    if len(parts) == 2 and parts[0] == "buy_prem" and parts[1] in PREMIUM_TARIFFS:
+        tariff_key = parts[1]
+        await grant_premium(message.from_user.id, tariff_key)
+        await message.answer(
+            f"👑 Оплата прошла! Тебе активирован <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b>.",
+            reply_markup=main_menu_kb(message.from_user.id),
+            parse_mode="HTML",
+        )
+        return
+
+    if len(parts) == 3 and parts[0] == "gift_prem" and parts[1].isdigit() and parts[2] in PREMIUM_TARIFFS:
+        recipient_id = int(parts[1])
+        tariff_key = parts[2]
+        await grant_premium(recipient_id, tariff_key)
+        await message.answer(
+            f"🎁 Подарок <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> отправлен пользователю <code>{recipient_id}</code>!",
+            reply_markup=main_menu_kb(message.from_user.id),
+            parse_mode="HTML",
+        )
+        try:
+            await bot.send_message(
+                recipient_id,
+                f"👑 Тебе подарили <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> от пользователя <code>{message.from_user.id}</code>!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+async def handle_admin_text_input(message: Message, bot: Bot) -> bool:
     if not is_admin(message.from_user.id):
         return False
 
@@ -897,154 +996,50 @@ async def handle_gift_mode(callback: CallbackQuery):
     await callback.answer()
 
 
-async def handle_users_shared(message: Message, bot: Bot):
+async def handle_users_shared(message: Message):
     if not message.users_shared or not message.users_shared.users:
         return
 
     shared = message.users_shared.users[0]
     recipient_id = shared.user_id
     sender_id = message.from_user.id
-    await ensure_user(sender_id, message.from_user.username, message.from_user.full_name)
-    sender = await get_user(sender_id)
+    state = pending_gift_state.get(sender_id) or {"mode": "coins"}
+    state["recipient_id"] = recipient_id
+    pending_gift_state[sender_id] = state
 
-    state = pending_gift_state.get(sender_id, {"mode": "coins"})
-    mode = state.get("mode", "coins")
+    await message.answer(
+        f"✅ Выбран пользователь ID <code>{recipient_id}</code>.",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode="HTML",
+    )
 
-    if mode == "coins" and not await user_exists(recipient_id):
-        pending_gift_state.pop(sender_id, None)
+    if state.get("mode") == "premium":
         await message.answer(
-            f"❌ Ошибка: выбранный пользователь (ID: <code>{recipient_id}</code>) не зарегистрирован в боте. "
-            "Отправить КоинТэг можно только тем, кто уже заходил в бота.",
-            reply_markup=main_menu_kb(sender_id),
-            parse_mode="HTML",
-        )
-        return
-
-    pending_gift_state[sender_id] = {"mode": mode, "recipient_id": recipient_id}
-    bot_info = await bot.get_me()
-
-    if mode == "coins":
-        gift_link = f"https://t.me/{bot_info.username}?start=gift_coins_{recipient_id}_500"
-        await message.answer(
-            f"📇 Выбран получатель ID: <code>{recipient_id}</code>\n"
-            f"Твой баланс: <b>{sender['coins']} КоинТэг</b>\n\n"
-            "Выбери сумму подарка кнопкой ниже:",
-            reply_markup=gift_coins_amounts_kb(),
-            parse_mode="HTML",
-        )
-        await message.answer(
-            f"Также при необходимости можно отправить ссылку получателю:\n<code>{gift_link}</code>",
-            reply_markup=back_menu_kb(sender_id),
+            f"👑 Выбери тариф Премиума для отправки пользователю <code>{recipient_id}</code>:",
+            reply_markup=premium_menu_kb("gift_prem_tariff"),
             parse_mode="HTML",
         )
     else:
         await message.answer(
-            f"📇 Выбран получатель ID: <code>{recipient_id}</code>\n"
-            f"Твой баланс: <b>{sender['coins']} КоинТэг</b>\n\n"
-            "Выбери тариф Премиум для подарка за звёзды:",
-            reply_markup=premium_menu_kb("gift_prem_select"),
+            f"🪙 Выбери сумму КоинТэг для подарка пользователю <code>{recipient_id}</code>:",
+            reply_markup=gift_coins_amounts_kb(),
             parse_mode="HTML",
         )
 
 
-async def handle_gift_coins_amount(callback: CallbackQuery, bot: Bot):
-    amount = int(callback.data.split(":", 1)[1])
-    sender_id = callback.from_user.id
-    state = pending_gift_state.get(sender_id)
-    recipient_id = state.get("recipient_id") if state else None
-
-    if not recipient_id:
-        await callback.answer("Сначала выбери получателя через «🎁 Подарок».", show_alert=True)
-        return
-
-    await ensure_user(sender_id, callback.from_user.username, callback.from_user.full_name)
-    ok, msg = await send_coins_gift(sender_id, recipient_id, amount, bot)
-
-    if not ok:
-        await callback.message.edit_text(msg, reply_markup=back_menu_kb(sender_id), parse_mode="HTML")
-        await callback.answer("Ошибка отправки подарка", show_alert=True)
-        return
-
-    await callback.message.edit_text(msg, reply_markup=back_menu_kb(sender_id), parse_mode="HTML")
-    await callback.answer("Подарок отправлен!", show_alert=True)
-
-
-async def handle_premium_or_gift_invoice(callback: CallbackQuery):
-    prefix, tariff_key = callback.data.split(":", 1)
-    tariff = PREMIUM_TARIFFS.get(tariff_key)
-    if not tariff:
-        await callback.answer("Тариф не найден", show_alert=True)
-        return
-
-    if prefix == "gift_prem_select":
-        state = pending_gift_state.get(callback.from_user.id)
-        recipient_id = state.get("recipient_id") if state else None
-        if not recipient_id:
-            await callback.answer("Сначала выбери получателя через «🎁 Подарок».", show_alert=True)
-            return
-        await callback.message.answer_invoice(
-            title=f"Подарок: {tariff['title']}",
-            description=f"Подарок «{tariff['title']}» для пользователя ID {recipient_id}",
-            payload=f"gift_prem:{recipient_id}:{tariff_key}",
-            currency="XTR",
-            prices=[LabeledPrice(label=tariff["title"], amount=tariff["stars"])],
+async def handle_text_messages(message: Message, bot: Bot):
+    if message.text and message.text.strip() == "❌ Отмена":
+        pending_gift_state.pop(message.from_user.id, None)
+        pending_admin_action.pop(message.from_user.id, None)
+        await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
+            reply_markup=main_menu_kb(message.from_user.id),
         )
-        await callback.answer()
         return
 
-    await callback.message.answer_invoice(
-        title=tariff["title"],
-        description=f"Активация статуса «{tariff['title']}»",
-        payload=f"self_prem:{tariff_key}",
-        currency="XTR",
-        prices=[LabeledPrice(label=tariff["title"], amount=tariff["stars"])],
-    )
-    await callback.answer()
-
-
-async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    await pre_checkout_query.answer(ok=True)
-
-
-async def handle_successful_payment(message: Message, bot: Bot):
-    payload = message.successful_payment.invoice_payload
-    parts = payload.split(":")
-
-    if parts[0] == "self_prem" and len(parts) >= 2:
-        tariff_key = parts[1]
-        if tariff_key in PREMIUM_TARIFFS:
-            await grant_premium(message.from_user.id, tariff_key)
-            await message.answer(
-                f"👑 Оплата прошла! Тариф <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> активирован!",
-                reply_markup=main_menu_kb(message.from_user.id),
-                parse_mode="HTML",
-            )
+    if await handle_admin_text_input(message, bot):
         return
-
-    if parts[0] == "gift_prem" and len(parts) >= 3:
-        recipient_id = int(parts[1])
-        tariff_key = parts[2]
-        if tariff_key in PREMIUM_TARIFFS:
-            await grant_premium(recipient_id, tariff_key)
-            await message.answer(
-                f"🎁 Оплата прошла! Тариф <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> подарен пользователю <code>{recipient_id}</code>!",
-                reply_markup=main_menu_kb(message.from_user.id),
-                parse_mode="HTML",
-            )
-            try:
-                await bot.send_message(
-                    recipient_id,
-                    f"🎁 Тебе подарили <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> от пользователя <code>{message.from_user.id}</code>!",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-
-
-async def handle_cancel_reply(message: Message):
-    pending_gift_state.pop(message.from_user.id, None)
-    pending_admin_action.pop(message.from_user.id, None)
-    await message.answer("Действие отменено.", reply_markup=main_menu_kb(message.from_user.id))
 
 
 async def main():
@@ -1054,26 +1049,20 @@ async def main():
 
     dp.message.register(handle_start, CommandStart())
     dp.message.register(handle_push_update_cmd, Command("push_update"))
-    dp.message.register(handle_cancel_reply, F.text == "❌ Отмена")
-    dp.message.register(handle_users_shared, F.users_shared)
     dp.message.register(handle_webapp_data, F.web_app_data)
+    dp.message.register(handle_users_shared, F.users_shared)
+    dp.message.register(handle_pre_checkout, PreCheckoutQuery)
     dp.message.register(handle_successful_payment, F.successful_payment)
-    dp.message.register(
-        handle_admin_text_input,
-        F.from_user.id == ADMIN_ID,
-        F.text,
-    )
 
     dp.callback_query.register(handle_menu_callbacks, F.data.startswith("menu:"))
     dp.callback_query.register(handle_admin_callbacks, F.data.startswith("adm:"))
+    dp.callback_query.register(handle_buy_prem, F.data.startswith("buy_prem:"))
     dp.callback_query.register(handle_gift_mode, F.data.startswith("gift_mode:"))
+    dp.callback_query.register(handle_gift_prem_tariff, F.data.startswith("gift_prem_tariff:"))
     dp.callback_query.register(handle_gift_coins_amount, F.data.startswith("gift_coins_amt:"))
-    dp.callback_query.register(
-        handle_premium_or_gift_invoice,
-        F.data.startswith("buy_prem:") | F.data.startswith("gift_prem_select:"),
-    )
 
     dp.pre_checkout_query.register(handle_pre_checkout)
+    dp.message.register(handle_text_messages, F.text)
 
     await dp.start_polling(bot)
 
