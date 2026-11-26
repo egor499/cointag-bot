@@ -76,13 +76,15 @@ def is_admin(user_id: int | None) -> bool:
     return bool(user_id is not None and int(user_id) == ADMIN_ID)
 
 
-def build_shop_webapp_url(user_id: int, coins: int) -> str:
+def build_shop_webapp_url(user_id: int, coins: int, bot_username: str = "LarplBot") -> str:
     sep = "&" if "?" in SHOP_WEBAPP_URL else "?"
     params = urlencode(
         {
             "user_id": user_id,
             "coins": coins,
             "rate": COINS_PER_STAR,
+            "bot": bot_username,
+            "v": int(time.time()),
             "items": json.dumps(
                 [
                     {
@@ -340,8 +342,8 @@ def premium_menu_kb(prefix: str = "buy_prem") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def shop_webapp_kb(user_id: int, coins: int) -> InlineKeyboardMarkup:
-    url = build_shop_webapp_url(user_id, coins)
+def shop_webapp_kb(user_id: int, coins: int, bot_username: str = "LarplBot") -> InlineKeyboardMarkup:
+    url = build_shop_webapp_url(user_id, coins, bot_username)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -422,6 +424,63 @@ async def push_update_to_all(bot: Bot) -> tuple[int, int]:
     return sent, failed
 
 
+async def process_gift_order(message: Message, item_key: str, bot: Bot):
+    item = TG_GIFTS.get(item_key)
+    if not item:
+        await message.answer("❌ Выбран неизвестный ТГ-подарок.", reply_markup=main_menu_kb(message.from_user.id))
+        return
+
+    user_id = message.from_user.id
+    await ensure_user(user_id, message.from_user.username, message.from_user.full_name)
+    user = await get_user(user_id)
+
+    if not user or user["coins"] < item["coins"]:
+        current = user["coins"] if user else 0
+        await message.answer(
+            f"❌ Недостаточно КоинТэг для вывода <b>{item['emoji']} {item['name']}</b>!\n"
+            f"Нужно: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★), у тебя: <b>{current} КоинТэг</b>.",
+            reply_markup=main_menu_kb(user_id),
+            parse_mode="HTML",
+        )
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE users SET coins = coins - ? WHERE user_id = ? AND coins >= ?",
+            (item["coins"], user_id, item["coins"]),
+        )
+        if cur.rowcount == 0:
+            await message.answer("❌ Недостаточно КоинТэг!", reply_markup=main_menu_kb(user_id))
+            return
+        await db.execute(
+            """
+            INSERT INTO shop_orders (user_id, item_key, coins_spent, status, created_at)
+            VALUES (?, ?, ?, 'pending', ?)
+            """,
+            (user_id, item_key, item["coins"], int(time.time())),
+        )
+        await db.commit()
+
+    await message.answer(
+        f"✅ Заявка на вывод ТГ-подарка <b>{item['emoji']} {item['name']}</b> оформлена!\n"
+        f"Списано: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★).",
+        reply_markup=main_menu_kb(user_id),
+        parse_mode="HTML",
+    )
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🛍 Новый вывод ТГ-подарка через Mini App:\n"
+            f"Пользователь: <code>{user_id}</code> (@{message.from_user.username or 'без_юзернейма'})\n"
+            f"Подарок: {item['emoji']} {item['name']}\n"
+            f"Списано: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★)",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
 async def show_profile(target: Message | CallbackQuery):
     user_id = target.from_user.id
     await ensure_user(user_id, target.from_user.username, target.from_user.full_name)
@@ -444,6 +503,7 @@ async def open_shop_app(callback: CallbackQuery):
     user_id = callback.from_user.id
     await ensure_user(user_id, callback.from_user.username, callback.from_user.full_name)
     user = await get_user(user_id)
+    bot_info = await callback.bot.get_me()
     lines = [
         "🛒 <b>Магазин ТГ-подарков</b>",
         f"Твой баланс: <b>{user['coins']} КоинТэг</b>",
@@ -455,7 +515,7 @@ async def open_shop_app(callback: CallbackQuery):
 
     await callback.message.edit_text(
         "\n".join(lines),
-        reply_markup=shop_webapp_kb(user_id, user["coins"]),
+        reply_markup=shop_webapp_kb(user_id, user["coins"], bot_info.username or "LarplBot"),
         parse_mode="HTML",
     )
     await callback.answer()
@@ -522,6 +582,11 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
         message.from_user.full_name,
         referrer_id=ref_id,
     )
+
+    if command.args and command.args.startswith("shop_"):
+        item_key = command.args.removeprefix("shop_")
+        await process_gift_order(message, item_key, bot)
+        return
 
     if command.args and command.args.startswith("gift_"):
         parts = command.args.split("_")
@@ -802,59 +867,7 @@ async def handle_webapp_data(message: Message, bot: Bot):
         return
 
     item_key = payload.get("item_id") or payload.get("item")
-    item = TG_GIFTS.get(item_key)
-    if not item:
-        await message.answer("❌ Выбран неизвестный ТГ-подарок.", reply_markup=main_menu_kb(message.from_user.id))
-        return
-
-    user_id = message.from_user.id
-    await ensure_user(user_id, message.from_user.username, message.from_user.full_name)
-    user = await get_user(user_id)
-
-    if user["coins"] < item["coins"]:
-        await message.answer(
-            f"❌ Недостаточно КоинТэг для вывода <b>{item['emoji']} {item['name']}</b>!\n"
-            f"Нужно: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★), у тебя: <b>{user['coins']} КоинТэг</b>.",
-            reply_markup=main_menu_kb(user_id),
-            parse_mode="HTML",
-        )
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE users SET coins = coins - ? WHERE user_id = ? AND coins >= ?",
-            (item["coins"], user_id, item["coins"]),
-        )
-        if cur.rowcount == 0:
-            await message.answer("❌ Недостаточно КоинТэг!", reply_markup=main_menu_kb(user_id))
-            return
-        await db.execute(
-            """
-            INSERT INTO shop_orders (user_id, item_key, coins_spent, status, created_at)
-            VALUES (?, ?, ?, 'pending', ?)
-            """,
-            (user_id, item_key, item["coins"], int(time.time())),
-        )
-        await db.commit()
-
-    await message.answer(
-        f"✅ Заявка на вывод ТГ-подарка <b>{item['emoji']} {item['name']}</b> оформлена!\n"
-        f"Списано: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★).",
-        reply_markup=main_menu_kb(user_id),
-        parse_mode="HTML",
-    )
-
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🛍 Новый вывод ТГ-подарка через Mini App:\n"
-            f"Пользователь: <code>{user_id}</code> (@{message.from_user.username or 'без_юзернейма'})\n"
-            f"Подарок: {item['emoji']} {item['name']}\n"
-            f"Списано: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★)",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
+    await process_gift_order(message, item_key, bot)
 
 
 async def handle_gift_mode(callback: CallbackQuery):
