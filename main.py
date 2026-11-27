@@ -26,13 +26,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
-# Ссылка на твоё веб-приложение (Mini App) магазина (обязательно https://)
 SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
-
-# Курс: 1 звезда = 25 коинов
 COINS_PER_STAR = 25
 
-# Тарифы премиума (используются и для покупки себе, и для подарка другу за звёзды)
 PREMIUM_TARIFFS = {
     "1d": {"title": "Премиум на 1 день", "stars": 3, "seconds": 86400},
     "7d": {"title": "Премиум на 7 дней", "stars": 18, "seconds": 7 * 86400},
@@ -40,27 +36,10 @@ PREMIUM_TARIFFS = {
     "forever": {"title": "Премиум НАВСЕГДА (УЛЬТРА СКИДКА)", "stars": 149, "seconds": None},
 }
 
-# ТГ-подарки магазина вывода:
-# мишка = 300 коинов (15 зв), сердечко = 500 коинов (25 зв), колечко = 1500 коинов (100 зв)
 TG_GIFTS = {
-    "bear": {
-        "name": "Мишка",
-        "emoji": "🧸",
-        "stars": 15,
-        "coins": 300,
-    },
-    "heart": {
-        "name": "Сердечко",
-        "emoji": "💖",
-        "stars": 25,
-        "coins": 500,
-    },
-    "ring": {
-        "name": "Колечко",
-        "emoji": "💍",
-        "stars": 100,
-        "coins": 1500,
-    },
+    "bear": {"name": "Мишка", "emoji": "🧸", "stars": 15, "coins": 300},
+    "heart": {"name": "Сердечко", "emoji": "💖", "stars": 25, "coins": 500},
+    "ring": {"name": "Колечко", "emoji": "💍", "stars": 100, "coins": 1500},
 }
 
 GIFT_COIN_AMOUNTS = [100, 500, 1500, 5000]
@@ -69,15 +48,12 @@ BONUS_COOLDOWN = 86400
 REF_BONUS_COINS = 15
 AUTO_DELETE_SECONDS = 60
 
-# Анти-абуз вывода подарков: 3 новых друга, зашедших в магазин -> окно на 24 часа
 WITHDRAW_REQUIRED_SHOP_REFS = 3
 WITHDRAW_WINDOW_SECONDS = 86400
 
-# Временное состояние для выбора подарка / суммы / действий админа
 pending_gift_state: dict[int, dict] = {}
 pending_admin_action: dict[int, str] = {}
 
-# Кэш активного экрана и активные таймеры автоудаления на пользователя
 active_screen_cache: dict[int, dict] = {}
 autodel_tasks: dict[int, asyncio.Task] = {}
 
@@ -86,6 +62,20 @@ def is_admin(user_id: int | None) -> bool:
     return bool(user_id is not None and int(user_id) == ADMIN_ID)
 
 
+def ikb_btn(
+    text: str,
+    callback_data: str | None = None,
+    web_app: WebAppInfo | None = None,
+    style: str | None = None,
+) -> InlineKeyboardButton:
+    kwargs: dict = {"text": text}
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+    if web_app is not None:
+        kwargs["web_app"] = web_app
+    if style is not None:
+        kwargs["style"] = style
+    return InlineKeyboardButton(**kwargs)
 def build_shop_webapp_url(
     user_id: int,
     coins: int,
@@ -160,7 +150,6 @@ async def init_db():
             """
         )
 
-        # Безопасные миграции для уже существующей БД
         cur = await db.execute("PRAGMA table_info(users)")
         existing_cols = {row[1] for row in await cur.fetchall()}
         migrations = [
@@ -174,8 +163,6 @@ async def init_db():
                 await db.execute(sql)
 
         await db.commit()
-
-
 async def user_exists(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
@@ -238,11 +225,6 @@ async def ensure_user(
 
 
 async def register_shop_open_and_check_ref(user_id: int, bot: Bot | None = None) -> dict:
-    """
-    Фиксирует первый заход пользователя в Mini App магазина.
-    Если у пользователя есть реферер и этот реферал ещё не засчитывался за вход в магазин —
-    засчитывает ровно 1 раз и при достижении 3 друзей открывает окно вывода на 24 часа.
-    """
     now_ts = int(time.time())
     unlocked_for_ref = None
 
@@ -320,9 +302,7 @@ async def register_shop_open_and_check_ref(user_id: int, bot: Bot | None = None)
             pass
 
     return {"unlocked": bool(unlocked_for_ref)}
-
-
-async def get_user(user_id: int):
+        async def get_user(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
@@ -435,28 +415,26 @@ async def grant_premium(target_user_id: int, tariff_key: str):
                     (new_until, target_user_id),
                 )
         await db.commit()
-
-
 def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text="👤 Профиль", callback_data="menu:profile"),
-            InlineKeyboardButton(text="🎁 Бонус", callback_data="menu:bonus"),
+            ikb_btn("👤 Профиль", callback_data="menu:profile", style="primary"),
+            ikb_btn("🎁 Бонус", callback_data="menu:bonus", style="success"),
         ],
         [
-            InlineKeyboardButton(text="👥 Рефералка", callback_data="menu:ref"),
-            InlineKeyboardButton(text="🛒 Магазин", callback_data="menu:shop"),
+            ikb_btn("👥 Рефералка", callback_data="menu:ref", style="success"),
+            ikb_btn("🛒 Магазин", callback_data="menu:shop", style="primary"),
         ],
         [
-            InlineKeyboardButton(text="👑 Премиум", callback_data="menu:premium"),
-            InlineKeyboardButton(text="⚡ VIP-раздел", callback_data="menu:vip"),
+            ikb_btn("👑 Премиум", callback_data="menu:premium", style="primary"),
+            ikb_btn("⚡ VIP-раздел", callback_data="menu:vip", style="danger"),
         ],
         [
-            InlineKeyboardButton(text="🎁 Подарок", callback_data="menu:gift"),
+            ikb_btn("🎁 Подарок", callback_data="menu:gift", style="success"),
         ],
     ]
     if is_admin(user_id):
-        rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="menu:admin")])
+        rows.append([ikb_btn("🛠 Админ-панель", callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -464,14 +442,14 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
-                InlineKeyboardButton(text="📣 Рассылка всем", callback_data="adm:broadcast"),
+                ikb_btn("📊 Статистика", callback_data="adm:stats", style="primary"),
+                ikb_btn("📣 Рассылка всем", callback_data="adm:broadcast", style="primary"),
             ],
             [
-                InlineKeyboardButton(text="🪙 Выдать/снять коины", callback_data="adm:coins"),
-                InlineKeyboardButton(text="👑 Выдать Премиум 30д", callback_data="adm:prem30"),
+                ikb_btn("🪙 Выдать/снять коины", callback_data="adm:coins", style="primary"),
+                ikb_btn("👑 Выдать Премиум 30д", callback_data="adm:prem30", style="primary"),
             ],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
+            [ikb_btn("⬅️ В меню", callback_data="menu:main", style="primary")],
         ]
     )
 
@@ -479,7 +457,7 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
 def back_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]
+            [ikb_btn("⬅️ В меню", callback_data="menu:main", style="primary")]
         ]
     )
 
@@ -488,10 +466,10 @@ def withdraw_locked_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="👥 Пригласить друзей", callback_data="menu:ref"),
-                InlineKeyboardButton(text="👑 Купить Премиум", callback_data="menu:premium"),
+                ikb_btn("👥 Пригласить друзей", callback_data="menu:ref", style="success"),
+                ikb_btn("👑 Купить Премиум", callback_data="menu:premium", style="primary"),
             ],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
+            [ikb_btn("⬅️ В меню", callback_data="menu:main", style="primary")],
         ]
     )
 
@@ -501,13 +479,14 @@ def premium_menu_kb(prefix: str = "buy_prem") -> InlineKeyboardMarkup:
     for key, t in PREMIUM_TARIFFS.items():
         rows.append(
             [
-                InlineKeyboardButton(
-                    text=f"{t['title']} — {t['stars']} ★",
+                ikb_btn(
+                    f"{t['title']} — {t['stars']} ★",
                     callback_data=f"{prefix}:{key}",
+                    style="primary",
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")])
+    rows.append([ikb_btn("⬅️ В меню", callback_data="menu:main", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -530,12 +509,12 @@ def shop_webapp_kb(
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="🛍 Открыть магазин подарков",
+                ikb_btn(
+                    "🛍 Открыть магазин подарков",
                     web_app=WebAppInfo(url=url),
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
+            [ikb_btn("⬅️ В меню", callback_data="menu:main", style="primary")],
         ]
     )
 
@@ -543,9 +522,9 @@ def shop_webapp_kb(
 def gift_type_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🪙 Подарить КоинТэг", callback_data="gift_mode:coins")],
-            [InlineKeyboardButton(text="👑 Подарить Премиум (★)", callback_data="gift_mode:premium")],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
+            [ikb_btn("🪙 Подарить КоинТэг", callback_data="gift_mode:coins", style="primary")],
+            [ikb_btn("👑 Подарить Премиум (★)", callback_data="gift_mode:premium", style="primary")],
+            [ikb_btn("⬅️ В меню", callback_data="menu:main", style="primary")],
         ]
     )
 
@@ -575,17 +554,16 @@ def gift_coins_amounts_kb() -> InlineKeyboardMarkup:
     for amt in GIFT_COIN_AMOUNTS:
         rows.append(
             [
-                InlineKeyboardButton(
-                    text=f"Подарить {amt} КоинТэг",
+                ikb_btn(
+                    f"Подарить {amt} КоинТэг",
                     callback_data=f"gift_coins_amt:{amt}",
+                    style="primary",
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")])
+    rows.append([ikb_btn("⬅️ В меню", callback_data="menu:main", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def clear_user_cache_and_timer(user_id: int, cancel_task: bool = False):
+        def clear_user_cache_and_timer(user_id: int, cancel_task: bool = False):
     active_screen_cache.pop(user_id, None)
     task = autodel_tasks.pop(user_id, None)
     if cancel_task and task and not task.done():
@@ -719,10 +697,8 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
     return (
         "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
         main_menu_kb(user_id),
-    )
-
-
-async def _autodel_worker(bot: Bot, user_id: int, chat_id: int, message_id: int, screen: str):
+        )
+        async def _autodel_worker(bot: Bot, user_id: int, chat_id: int, message_id: int, screen: str):
     try:
         await asyncio.sleep(AUTO_DELETE_SECONDS)
     except asyncio.CancelledError:
@@ -835,9 +811,6 @@ async def process_gift_order(message: Message, item_key: str, bot: Bot):
         await message.answer("❌ Профиль не найден.", reply_markup=main_menu_kb(user_id))
         return
 
-    # Анти-абуз проверка доступа к выводу подарка:
-    # 1) Активный PREMIUM -> разрешено без дополнительных условий
-    # 2) Иначе активно 24-часовое окно после 3 новых друзей в магазине
     if not is_premium_active(user):
         has_win, _ = has_active_withdraw_window(user)
         if not has_win:
@@ -897,8 +870,6 @@ async def process_gift_order(message: Message, item_key: str, bot: Bot):
         )
     except Exception:
         pass
-
-
 async def show_profile(target: Message | CallbackQuery):
     user_id = target.from_user.id
     await ensure_user(user_id, target.from_user.username, target.from_user.full_name)
@@ -1032,9 +1003,7 @@ async def handle_push_update_cmd(message: Message, bot: Bot):
         f"✅ Рассылка обновления завершена. Доставлено: <b>{sent}</b>, ошибок: <b>{failed}</b>",
         reply_markup=admin_panel_kb(),
         parse_mode="HTML",
-    )
-
-
+)
 async def handle_menu_callbacks(callback: CallbackQuery):
     action = callback.data.split(":", 1)[1]
     user_id = callback.from_user.id
@@ -1283,8 +1252,6 @@ async def handle_successful_payment(message: Message, bot: Bot):
             )
         except Exception:
             pass
-
-
 async def handle_admin_text_input(message: Message, bot: Bot) -> bool:
     if not is_admin(message.from_user.id):
         return False
