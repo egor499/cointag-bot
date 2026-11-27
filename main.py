@@ -73,7 +73,7 @@ AUTO_DELETE_SECONDS = 60
 pending_gift_state: dict[int, dict] = {}
 pending_admin_action: dict[int, str] = {}
 
-# Кэш активного экрана и активные таймеры автоудаления на пользователя
+# Кэш активного экрана и активные таймеры автоудаления/автообновления на пользователя
 active_screen_cache: dict[int, dict] = {}
 autodel_tasks: dict[int, asyncio.Task] = {}
 
@@ -321,15 +321,15 @@ def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
             make_btn("🛒 Магазин", style="success", callback_data="menu:shop"),
         ],
         [
-            make_btn("👑 Премиум", style="primary", callback_data="menu:premium"),
-            make_btn("⚡ VIP-раздел", style="success", callback_data="menu:vip"),
+            make_btn("👑 Премиум", style="success", callback_data="menu:premium"),
+            make_btn("⚡ VIP-раздел", style="danger", callback_data="menu:vip"),
         ],
         [
             make_btn("🎁 Подарок", style="danger", callback_data="menu:gift"),
         ],
     ]
     if is_admin(user_id):
-        rows.append([make_btn("🛠 Админ-панель", style ="danger", callback_data="menu:admin")])
+        rows.append([make_btn("🛠 Админ-панель", style="primary", callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -530,16 +530,36 @@ async def _autodel_worker(bot: Bot, user_id: int, chat_id: int, message_id: int,
     except asyncio.CancelledError:
         return
 
+    if autodel_tasks.get(user_id) is not asyncio.current_task():
+        return
+
     cached = active_screen_cache.get(user_id)
-    if cached and cached.get("message_id") == message_id:
-        active_screen_cache.pop(user_id, None)
-    if autodel_tasks.get(user_id) is asyncio.current_task():
-        autodel_tasks.pop(user_id, None)
+    if not cached or cached.get("message_id") != message_id:
+        return
+
+    current_screen = cached.get("screen") or screen or "main"
+    current_chat_id = cached.get("chat_id") or chat_id
+
+    autodel_tasks.pop(user_id, None)
+    active_screen_cache.pop(user_id, None)
 
     try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await bot.delete_message(chat_id=current_chat_id, message_id=message_id)
     except Exception as e:
         print(f"[autodel] delete_message failed for user={user_id} msg={message_id}: {e}")
+
+    # Если пользователь уже переключился на другой экран пока шла задержка — не перетираем новый экран
+    if user_id in active_screen_cache:
+        return
+
+    try:
+        payload = await build_screen_payload(bot, user_id, current_screen)
+        if not payload:
+            return
+        text, kb = payload
+        await send_screen_with_autodel(bot, user_id, current_chat_id, current_screen, text, kb)
+    except Exception as e:
+        print(f"[autodel] refresh failed for user={user_id} screen={current_screen}: {e}")
 
 
 async def send_screen_with_autodel(
