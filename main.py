@@ -304,12 +304,12 @@ async def register_shop_open_and_check_ref(user_id: int, bot: Bot | None = None)
     return {"unlocked": bool(unlocked_for_ref)}
     async def get_user(user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        if not row:
-            return None
-        cols = [col[0] for col in cursor.description]
-        return dict(zip(cols, row))
+            cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            cols = [col[0] for col in cursor.description]
+            return dict(zip(cols, row))
 
 
 async def cleanup_expired_premiums_db():
