@@ -29,7 +29,7 @@ DB_PATH = os.environ.get("DB_PATH", "bot.db")
 # Ссылка на твоё веб-приложение (Mini App) магазина (обязательно https://)
 SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
 
-# Курс: 1 звезда = 100 коинов
+# Курс: 1 звезда = 25 коинов
 COINS_PER_STAR = 25
 
 # Тарифы премиума (используются и для покупки себе, и для подарка другу за звёзды)
@@ -68,6 +68,10 @@ BONUS_COINS = 5
 BONUS_COOLDOWN = 86400
 REF_BONUS_COINS = 15
 AUTO_DELETE_SECONDS = 60
+
+# Анти-абуз вывода подарков: 3 новых друга, зашедших в магазин -> окно на 24 часа
+WITHDRAW_REQUIRED_SHOP_REFS = 3
+WITHDRAW_WINDOW_SECONDS = 86400
 
 # Временное состояние для выбора подарка / суммы / действий админа
 pending_gift_state: dict[int, dict] = {}
@@ -125,7 +129,11 @@ async def init_db():
                 premium_forever INTEGER DEFAULT 0,
                 last_bonus INTEGER DEFAULT 0,
                 referrer_id INTEGER,
-                referrals_count INTEGER DEFAULT 0
+                referrals_count INTEGER DEFAULT 0,
+                app_opened INTEGER DEFAULT 0,
+                ref_shop_counted INTEGER DEFAULT 0,
+                shop_refs_progress INTEGER DEFAULT 0,
+                withdraw_until INTEGER DEFAULT 0
             )
             """
         )
@@ -141,6 +149,20 @@ async def init_db():
             )
             """
         )
+
+        # Безопасные миграции для уже существующей БД
+        cur = await db.execute("PRAGMA table_info(users)")
+        existing_cols = {row[1] for row in await cur.fetchall()}
+        migrations = [
+            ("app_opened", "ALTER TABLE users ADD COLUMN app_opened INTEGER DEFAULT 0"),
+            ("ref_shop_counted", "ALTER TABLE users ADD COLUMN ref_shop_counted INTEGER DEFAULT 0"),
+            ("shop_refs_progress", "ALTER TABLE users ADD COLUMN shop_refs_progress INTEGER DEFAULT 0"),
+            ("withdraw_until", "ALTER TABLE users ADD COLUMN withdraw_until INTEGER DEFAULT 0"),
+        ]
+        for col_name, sql in migrations:
+            if col_name not in existing_cols:
+                await db.execute(sql)
+
         await db.commit()
 
 
@@ -165,8 +187,11 @@ async def ensure_user(
             valid_ref = referrer_id if (referrer_id and referrer_id != user_id) else None
             await db.execute(
                 """
-                INSERT INTO users (user_id, username, full_name, coins, referrer_id)
-                VALUES (?, ?, ?, 10, ?)
+                INSERT INTO users (
+                    user_id, username, full_name, coins, referrer_id,
+                    app_opened, ref_shop_counted, shop_refs_progress, withdraw_until
+                )
+                VALUES (?, ?, ?, 10, ?, 0, 0, 0, 0)
                 """,
                 (user_id, username, full_name, valid_ref),
             )
@@ -200,6 +225,92 @@ async def ensure_user(
                 (username, full_name, user_id),
             )
             await db.commit()
+
+
+async def register_shop_open_and_check_ref(user_id: int, bot: Bot | None = None) -> dict:
+    """
+    Фиксирует первый заход пользователя в Mini App магазина.
+    Если у пользователя есть реферер и этот реферал ещё не засчитывался за вход в магазин —
+    засчитывает ровно 1 раз и при достижении 3 друзей открывает окно вывода на 24 часа.
+    """
+    now_ts = int(time.time())
+    unlocked_for_ref = None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT referrer_id, app_opened, ref_shop_counted
+            FROM users
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return {"unlocked": False}
+
+        referrer_id, app_opened, ref_shop_counted = row[0], row[1] or 0, row[2] or 0
+
+        if app_opened == 0:
+            await db.execute(
+                "UPDATE users SET app_opened = 1 WHERE user_id = ?",
+                (user_id,),
+            )
+
+        if referrer_id and referrer_id != user_id and ref_shop_counted == 0:
+            # Помечаем реферала как засчитанного за вход в магазин строго один раз
+            mark_cur = await db.execute(
+                """
+                UPDATE users
+                SET ref_shop_counted = 1
+                WHERE user_id = ? AND ref_shop_counted = 0
+                """,
+                (user_id,),
+            )
+            if mark_cur.rowcount > 0:
+                ref_cur = await db.execute(
+                    "SELECT shop_refs_progress FROM users WHERE user_id = ?",
+                    (referrer_id,),
+                )
+                ref_row = await ref_cur.fetchone()
+                if ref_row:
+                    progress = (ref_row[0] or 0) + 1
+                    if progress >= WITHDRAW_REQUIRED_SHOP_REFS:
+                        new_progress = progress - WITHDRAW_REQUIRED_SHOP_REFS
+                        new_until = now_ts + WITHDRAW_WINDOW_SECONDS
+                        await db.execute(
+                            """
+                            UPDATE users
+                            SET shop_refs_progress = ?, withdraw_until = ?
+                            WHERE user_id = ?
+                            """,
+                            (new_progress, new_until, referrer_id),
+                        )
+                        unlocked_for_ref = referrer_id
+                    else:
+                        await db.execute(
+                            """
+                            UPDATE users
+                            SET shop_refs_progress = ?
+                            WHERE user_id = ?
+                            """,
+                            (progress, referrer_id),
+                        )
+
+        await db.commit()
+
+    if unlocked_for_ref and bot:
+        try:
+            await bot.send_message(
+                unlocked_for_ref,
+                "🔓 <b>Открыт доступ к выводу подарков на 24 часа!</b>\n"
+                f"<b>{WITHDRAW_REQUIRED_SHOP_REFS}</b> твоих друзей зашли в магазин. Успей оформить вывод в течение 24 часов!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    return {"unlocked": bool(unlocked_for_ref)}
 
 
 async def get_user(user_id: int):
@@ -262,6 +373,23 @@ def format_premium_status(user: dict) -> str:
         dt = datetime.fromtimestamp(user["premium_until"], tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
         return f"PREMIUM до {dt} 👑"
     return "Базовый"
+
+
+def has_active_withdraw_window(user: dict) -> tuple[bool, int]:
+    if not user:
+        return False, 0
+    now_ts = int(time.time())
+    w_until = int(user.get("withdraw_until") or 0)
+    if w_until > now_ts:
+        return True, w_until - now_ts
+    return False, 0
+
+
+def format_remaining_time(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    mins = (seconds % 3600) // 60
+    return f"{hours} ч {mins} мин"
 
 
 async def grant_premium(target_user_id: int, tariff_key: str):
@@ -343,6 +471,18 @@ def back_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]
+        ]
+    )
+
+
+def withdraw_locked_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👥 Пригласить друзей", callback_data="menu:ref"),
+                InlineKeyboardButton(text="👑 Купить Премиум", callback_data="menu:premium"),
+            ],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
         ]
     )
 
@@ -436,32 +576,68 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
         return None
 
     if screen == "profile":
+        has_win, rem_sec = has_active_withdraw_window(user)
+        if is_premium_active(user):
+            withdraw_line = "🔓 Вывод подарков: <b>Доступен (PREMIUM)</b>"
+        elif has_win:
+            withdraw_line = f"🔓 Окно вывода: <b>активно ещё {format_remaining_time(rem_sec)}</b>"
+        else:
+            prog = int(user.get("shop_refs_progress") or 0)
+            withdraw_line = (
+                f"🔒 Окно вывода: <b>закрыто</b> "
+                f"(друзей в магазине: <b>{prog}/{WITHDRAW_REQUIRED_SHOP_REFS}</b>)"
+            )
+
         text = (
             "👤 <b>Твой профиль</b>\n\n"
             f"🆔 ID: <code>{user['user_id']}</code>\n"
             f"🏅 Статус: <b>{format_premium_status(user)}</b>\n"
             f"🪙 Баланс: <b>{user['coins']} КоинТэг</b>\n"
-            f"👥 Приглашено друзей: <b>{user['referrals_count']}</b>"
+            f"👥 Приглашено друзей: <b>{user['referrals_count']}</b>\n"
+            f"{withdraw_line}"
         )
         return text, back_menu_kb(user_id)
 
     if screen == "ref":
         bot_info = await bot.get_me()
         ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+        prog = int(user.get("shop_refs_progress") or 0)
+        has_win, rem_sec = has_active_withdraw_window(user)
+        win_status = (
+            f"🔓 Активно ещё <b>{format_remaining_time(rem_sec)}</b>"
+            if has_win
+            else f"🔒 Нужно ещё <b>{max(0, WITHDRAW_REQUIRED_SHOP_REFS - prog)}</b> друга в магазине (прогресс: <b>{prog}/{WITHDRAW_REQUIRED_SHOP_REFS}</b>)"
+        )
         text = (
             "👥 <b>Реферальная система</b>\n\n"
             f"За каждого нового друга ты получаешь <b>+{REF_BONUS_COINS} КоинТэг</b> (с PREMIUM — x2).\n"
-            f"Приглашено друзей: <b>{user['referrals_count']}</b>\n\n"
+            f"Чтобы открыть вывод подарков на <b>24 часа</b>, нужно привести <b>{WITHDRAW_REQUIRED_SHOP_REFS} новых друзей</b>, которые откроют магазин (либо иметь активный PREMIUM).\n\n"
+            f"Приглашено друзей: <b>{user['referrals_count']}</b>\n"
+            f"Статус вывода: {win_status}\n\n"
             f"Твоя ссылка:\n{ref_link}"
         )
         return text, back_menu_kb(user_id)
 
     if screen == "shop":
         bot_info = await bot.get_me()
+        has_win, rem_sec = has_active_withdraw_window(user)
+        prog = int(user.get("shop_refs_progress") or 0)
+
+        if is_premium_active(user):
+            access_note = "🔓 Доступ к выводу: <b>открыт (PREMIUM)</b>"
+        elif has_win:
+            access_note = f"🔓 Доступ к выводу: <b>открыт ещё {format_remaining_time(rem_sec)}</b>"
+        else:
+            access_note = (
+                f"🔒 Вывод откроется на <b>24 часа</b> после <b>{WITHDRAW_REQUIRED_SHOP_REFS} новых друзей</b> в магазине "
+                f"(сейчас <b>{prog}/{WITHDRAW_REQUIRED_SHOP_REFS}</b>) или с <b>PREMIUM</b>"
+            )
+
         lines = [
             "🛒 <b>Магазин ТГ-подарков</b>",
             f"Твой баланс: <b>{user['coins']} КоинТэг</b>",
-            f"Курс вывода: <b>1 ★ = {COINS_PER_STAR} КоинТэг</b>\n",
+            f"Курс вывода: <b>1 ★ = {COINS_PER_STAR} КоинТэг</b>",
+            f"{access_note}\n",
             "Доступные подарки к выводу:",
         ]
         for item in TG_GIFTS.values():
@@ -472,6 +648,9 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
         text = (
             "👑 <b>Премиум-статус</b>\n"
             f"Текущий статус: <b>{format_premium_status(user)}</b>\n\n"
+            "Преимущества PREMIUM:\n"
+            "• x2 за рефералов и доступ к VIP-разделу\n"
+            "• Вывод подарков без ожидания 3 друзей в магазине\n\n"
             "Выбери тариф:"
         )
         return text, premium_menu_kb("buy_prem")
@@ -516,7 +695,6 @@ async def _autodel_worker(bot: Bot, user_id: int, chat_id: int, message_id: int,
     except asyncio.CancelledError:
         return
 
-    # Удаляем запись из кэша, чтобы кэш не засорялся
     cached = active_screen_cache.get(user_id)
     if cached and cached.get("message_id") == message_id:
         active_screen_cache.pop(user_id, None)
@@ -544,7 +722,6 @@ async def send_screen_with_autodel(
     text: str,
     kb: InlineKeyboardMarkup,
 ) -> Message:
-    # Отменяем старый таймер и чистим старый кэш перед отправкой нового экрана
     clear_user_cache_and_timer(user_id, cancel_task=True)
 
     msg = await bot.send_message(
@@ -618,13 +795,35 @@ async def process_gift_order(message: Message, item_key: str, bot: Bot):
 
     user_id = message.from_user.id
     await ensure_user(user_id, message.from_user.username, message.from_user.full_name)
+    await cleanup_expired_premiums_db()
     user = await get_user(user_id)
 
-    if not user or user["coins"] < item["coins"]:
-        current = user["coins"] if user else 0
+    if not user:
+        await message.answer("❌ Профиль не найден.", reply_markup=main_menu_kb(user_id))
+        return
+
+    # Анти-абуз проверка доступа к выводу подарка:
+    # 1) Активный PREMIUM -> разрешено без дополнительных условий
+    # 2) Иначе активно 24-часовое окно после 3 новых друзей в магазине
+    if not is_premium_active(user):
+        has_win, _ = has_active_withdraw_window(user)
+        if not has_win:
+            prog = int(user.get("shop_refs_progress") or 0)
+            left = max(0, WITHDRAW_REQUIRED_SHOP_REFS - prog)
+            await message.answer(
+                f"🔒 <b>Вывод подарков пока закрыт</b>\n\n"
+                f"Чтобы открыть окно вывода на <b>24 часа</b>, пригласи <b>{WITHDRAW_REQUIRED_SHOP_REFS} новых друзей</b>, которые откроют магазин "
+                f"(сейчас прогресс: <b>{prog}/{WITHDRAW_REQUIRED_SHOP_REFS}</b>, осталось: <b>{left}</b>) "
+                f"или оформи <b>👑 PREMIUM</b>.",
+                reply_markup=withdraw_locked_kb(),
+                parse_mode="HTML",
+            )
+            return
+
+    if user["coins"] < item["coins"]:
         await message.answer(
             f"❌ Недостаточно КоинТэг для вывода <b>{item['emoji']} {item['name']}</b>!\n"
-            f"Нужно: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★), у тебя: <b>{current} КоинТэг</b>.",
+            f"Нужно: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★), у тебя: <b>{user['coins']} КоинТэг</b>.",
             reply_markup=main_menu_kb(user_id),
             parse_mode="HTML",
         )
@@ -683,6 +882,7 @@ async def show_profile(target: Message | CallbackQuery):
 async def open_shop_app(callback: CallbackQuery):
     user_id = callback.from_user.id
     await ensure_user(user_id, callback.from_user.username, callback.from_user.full_name)
+    await register_shop_open_and_check_ref(user_id, callback.bot)
     payload = await build_screen_payload(callback.bot, user_id, "shop")
     if not payload:
         await callback.answer()
@@ -754,6 +954,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
 
     if command.args and command.args.startswith("shop_"):
         item_key = command.args.removeprefix("shop_")
+        await register_shop_open_and_check_ref(message.from_user.id, bot)
         await process_gift_order(message, item_key, bot)
         return
 
@@ -1121,6 +1322,9 @@ async def handle_admin_text_input(message: Message, bot: Bot) -> bool:
 async def handle_webapp_data(message: Message, bot: Bot):
     if not message.web_app_data:
         return
+    await ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+    await register_shop_open_and_check_ref(message.from_user.id, bot)
+
     try:
         payload = json.loads(message.web_app_data.data)
     except Exception:
