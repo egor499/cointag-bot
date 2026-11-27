@@ -86,7 +86,14 @@ def is_admin(user_id: int | None) -> bool:
     return bool(user_id is not None and int(user_id) == ADMIN_ID)
 
 
-def build_shop_webapp_url(user_id: int, coins: int, bot_username: str = "LarplBot") -> str:
+def build_shop_webapp_url(
+    user_id: int,
+    coins: int,
+    bot_username: str = "LarplBot",
+    has_premium: bool = False,
+    withdraw_left: int = 0,
+    shop_refs: int = 0,
+) -> str:
     sep = "&" if "?" in SHOP_WEBAPP_URL else "?"
     params = urlencode(
         {
@@ -94,6 +101,9 @@ def build_shop_webapp_url(user_id: int, coins: int, bot_username: str = "LarplBo
             "coins": coins,
             "rate": COINS_PER_STAR,
             "bot": bot_username,
+            "has_premium": 1 if has_premium else 0,
+            "withdraw_left": max(0, int(withdraw_left)),
+            "shop_refs": max(0, int(shop_refs)),
             "v": int(time.time()),
             "items": json.dumps(
                 [
@@ -258,7 +268,6 @@ async def register_shop_open_and_check_ref(user_id: int, bot: Bot | None = None)
             )
 
         if referrer_id and referrer_id != user_id and ref_shop_counted == 0:
-            # Помечаем реферала как засчитанного за вход в магазин строго один раз
             mark_cur = await db.execute(
                 """
                 UPDATE users
@@ -502,8 +511,22 @@ def premium_menu_kb(prefix: str = "buy_prem") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def shop_webapp_kb(user_id: int, coins: int, bot_username: str = "LarplBot") -> InlineKeyboardMarkup:
-    url = build_shop_webapp_url(user_id, coins, bot_username)
+def shop_webapp_kb(
+    user_id: int,
+    coins: int,
+    bot_username: str = "LarplBot",
+    has_premium: bool = False,
+    withdraw_left: int = 0,
+    shop_refs: int = 0,
+) -> InlineKeyboardMarkup:
+    url = build_shop_webapp_url(
+        user_id=user_id,
+        coins=coins,
+        bot_username=bot_username,
+        has_premium=has_premium,
+        withdraw_left=withdraw_left,
+        shop_refs=shop_refs,
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -621,9 +644,10 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
     if screen == "shop":
         bot_info = await bot.get_me()
         has_win, rem_sec = has_active_withdraw_window(user)
+        has_prem = is_premium_active(user)
         prog = int(user.get("shop_refs_progress") or 0)
 
-        if is_premium_active(user):
+        if has_prem:
             access_note = "🔓 Доступ к выводу: <b>открыт (PREMIUM)</b>"
         elif has_win:
             access_note = f"🔓 Доступ к выводу: <b>открыт ещё {format_remaining_time(rem_sec)}</b>"
@@ -642,7 +666,16 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
         ]
         for item in TG_GIFTS.values():
             lines.append(f"• {item['emoji']} <b>{item['name']}</b> — <b>{item['coins']} КоинТэг</b> ({item['stars']} ★)")
-        return "\n".join(lines), shop_webapp_kb(user_id, user["coins"], bot_info.username or "LarplBot")
+
+        kb = shop_webapp_kb(
+            user_id=user_id,
+            coins=user["coins"],
+            bot_username=bot_info.username or "LarplBot",
+            has_premium=has_prem,
+            withdraw_left=rem_sec if has_win else 0,
+            shop_refs=prog,
+        )
+        return "\n".join(lines), kb
 
     if screen == "premium":
         text = (
