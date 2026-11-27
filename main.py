@@ -314,10 +314,10 @@ def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
             make_btn("👤 Профиль", style="primary", callback_data="menu:profile"),
-            make_btn("🎁 Бонус", style="success", callback_data="menu:bonus"),
+            make_btn("🎁 Бонус", style="primary", callback_data="menu:bonus"),
         ],
         [
-            make_btn("👥 Рефералка", style="success", callback_data="menu:ref"),
+            make_btn("👥 Рефералка", style="primary", callback_data="menu:ref"),
             make_btn("🛒 Магазин", style="primary", callback_data="menu:shop"),
         ],
         [
@@ -325,7 +325,7 @@ def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
             make_btn("⚡ VIP-раздел", style="danger", callback_data="menu:vip"),
         ],
         [
-            make_btn("🎁 Подарок", style="success", callback_data="menu:gift"),
+            make_btn("🎁 Подарок", style="primary", callback_data="menu:gift"),
         ],
     ]
     if is_admin(user_id):
