@@ -313,19 +313,19 @@ async def grant_premium(target_user_id: int, tariff_key: str):
 def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
-            make_btn("👤 Профиль", style="primary", callback_data="menu:profile"),
-            make_btn("🎁 Бонус", style="primary", callback_data="menu:bonus"),
+            make_btn("👤 Профиль", style="success", callback_data="menu:profile"),
+            make_btn("🎁 Бонус", style="success", callback_data="menu:bonus"),
         ],
         [
-            make_btn("👥 Рефералка", style="primary", callback_data="menu:ref"),
-            make_btn("🛒 Магазин", style="primary", callback_data="menu:shop"),
+            make_btn("👥 Рефералка", style="success", callback_data="menu:ref"),
+            make_btn("🛒 Магазин", style="success", callback_data="menu:shop"),
         ],
         [
-            make_btn("👑 Премиум", style="primary", callback_data="menu:premium"),
+            make_btn("👑 Премиум", style="success", callback_data="menu:premium"),
             make_btn("⚡ VIP-раздел", style="danger", callback_data="menu:vip"),
         ],
         [
-            make_btn("🎁 Подарок", style="primary", callback_data="menu:gift"),
+            make_btn("🎁 Подарок", style="success", callback_data="menu:gift"),
         ],
     ]
     if is_admin(user_id):
