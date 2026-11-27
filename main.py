@@ -313,11 +313,11 @@ async def grant_premium(target_user_id: int, tariff_key: str):
 def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
-            make_btn("👤 Профиль", style="success", callback_data="menu:profile"),
+            make_btn("👤 Профиль", style="primary", callback_data="menu:profile"),
             make_btn("🎁 Бонус", style="success", callback_data="menu:bonus"),
         ],
         [
-            make_btn("👥 Рефералка", style="success", callback_data="menu:ref"),
+            make_btn("👥 Рефералка", style="primary", callback_data="menu:ref"),
             make_btn("🛒 Магазин", style="success", callback_data="menu:shop"),
         ],
         [
@@ -329,7 +329,7 @@ def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
         ],
     ]
     if is_admin(user_id):
-        rows.append([make_btn("🛠 Админ-панель", callback_data="menu:admin")])
+        rows.append([make_btn("🛠 Админ-панель", style ="primary", callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
