@@ -317,19 +317,19 @@ def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
             make_btn("🎁 Бонус", style="success", callback_data="menu:bonus"),
         ],
         [
-            make_btn("👥 Рефералка", callback_data="menu:ref"),
+            make_btn("👥 Рефералка", style="success", callback_data="menu:ref"),
             make_btn("🛒 Магазин", style="primary", callback_data="menu:shop"),
         ],
         [
-            make_btn("👑 Премиум", style="success", callback_data="menu:premium"),
-            make_btn("⚡ VIP-раздел", callback_data="menu:vip"),
+            make_btn("👑 Премиум", style="primary", callback_data="menu:premium"),
+            make_btn("⚡ VIP-раздел", style="danger", callback_data="menu:vip"),
         ],
         [
-            make_btn("🎁 Подарок", callback_data="menu:gift"),
+            make_btn("🎁 Подарок", style="success", callback_data="menu:gift"),
         ],
     ]
     if is_admin(user_id):
-        rows.append([make_btn("🛠 Админ-панель", style="danger", callback_data="menu:admin")])
+        rows.append([make_btn("🛠 Админ-панель", callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
