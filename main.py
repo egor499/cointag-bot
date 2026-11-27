@@ -131,19 +131,19 @@ def build_shop_webapp_url(user_id: int, coins: int, bot_username: str = "LarplBo
 
 def build_promo_messages(user_id: int, coins: int, bot_username: str) -> list[tuple[str, InlineKeyboardMarkup]]:
     shop_url = build_shop_webapp_url(user_id, coins, bot_username)
-    bot_link = f"https://t.me/{bot_username}?start=promo"
+    webapp = WebAppInfo(url=shop_url)
 
     return [
         (
             "🎁 <b>Выбирай, какой подарок хочешь 👇</b>\n\n"
             "<blockquote>"
-            "⭐ 1000 звёзд\n"
-            "👑 Telegram Premium на 12 месяцев\n"
-            "🎁 NFT-подарок"
+            "🧸 Мишка\n"
+            "🪙 100 коинов\n"
+            "👑 7 дней бесплатного премиум в боте"
             "</blockquote>",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [make_btn("💎 Выбрать подарок", style="primary", web_app=WebAppInfo(url=shop_url))]
+                    [make_btn("💎 Выбрать подарок", style="primary", web_app=webapp)]
                 ]
             ),
         ),
@@ -151,7 +151,7 @@ def build_promo_messages(user_id: int, coins: int, bot_username: str) -> list[tu
             "✅ <b>Всё готово — ваши подарки ждут! 👇</b>",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [make_btn("🎁 Забрать", style="success", url=bot_link)]
+                    [make_btn("🎁 Забрать", style="success", web_app=webapp)]
                 ]
             ),
         ),
@@ -159,7 +159,7 @@ def build_promo_messages(user_id: int, coins: int, bot_username: str) -> list[tu
             "🎁 <b>Всё на месте — забирайте свои подарки! 👇</b>",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [make_btn("🎁 Забрать подарки", style="danger", url=bot_link)]
+                    [make_btn("🎁 Забрать подарки", style="danger", web_app=webapp)]
                 ]
             ),
         ),
@@ -167,7 +167,7 @@ def build_promo_messages(user_id: int, coins: int, bot_username: str) -> list[tu
             "⏳ <b>Всё готово — но подарки ждут недолго! 👇</b>",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [make_btn("🎁 Успеть забрать", style="primary", url=bot_link)]
+                    [make_btn("🎁 Успеть забрать", style="primary", web_app=webapp)]
                 ]
             ),
         ),
