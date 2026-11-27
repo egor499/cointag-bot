@@ -80,6 +80,9 @@ pending_admin_action: dict[int, str] = {}
 active_screen_cache: dict[int, dict] = {}
 autodel_tasks: dict[int, asyncio.Task] = {}
 
+# Персональные 2-часовые циклы промо-рассылки на пользователя
+user_promo_loop_tasks: dict[int, asyncio.Task] = {}
+
 # Кэш и таймеры автоудаления промо-сообщений (удаляются через 4 часа без переоткрытия)
 active_promo_cache: dict[tuple[int, int], dict] = {}
 promo_autodel_tasks: dict[tuple[int, int], asyncio.Task] = {}
@@ -631,43 +634,65 @@ async def _promo_autodel_worker(bot: Bot, chat_id: int, message_id: int):
         print(f"[promo_autodel] delete failed chat={chat_id} msg={message_id}: {e}")
 
 
-async def _promo_broadcast_worker(bot: Bot):
-    while True:
-        await asyncio.sleep(PROMO_INTERVAL_SECONDS)
-        try:
-            bot_info = await bot.get_me()
-            bot_username = bot_info.username or "LarplBot"
+async def send_one_random_promo(bot: Bot, user_id: int):
+    try:
+        user = await get_user(user_id)
+        if not user:
+            return
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username or "LarplBot"
+        variants = build_promo_messages(user_id, user.get("coins") or 0, bot_username)
+        text, kb = random.choice(variants)
 
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT user_id, coins FROM users") as cursor:
-                    users = await cursor.fetchall()
+        msg = await bot.send_message(
+            chat_id=user_id,
+            text=text,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        key = (msg.chat.id, msg.message_id)
+        active_promo_cache[key] = {
+            "chat_id": msg.chat.id,
+            "message_id": msg.message_id,
+            "sent_at": int(time.time()),
+        }
+        promo_autodel_tasks[key] = asyncio.create_task(
+            _promo_autodel_worker(bot, msg.chat.id, msg.message_id)
+        )
+    except Exception as e:
+        print(f"[promo_send] failed for user={user_id}: {e}")
 
-            for uid, coins in users:
-                variants = build_promo_messages(uid, coins or 0, bot_username)
-                text, kb = random.choice(variants)
-                try:
-                    msg = await bot.send_message(
-                        chat_id=uid,
-                        text=text,
-                        reply_markup=kb,
-                        parse_mode="HTML",
-                    )
-                    key = (msg.chat.id, msg.message_id)
-                    active_promo_cache[key] = {
-                        "chat_id": msg.chat.id,
-                        "message_id": msg.message_id,
-                        "sent_at": int(time.time()),
-                    }
-                    promo_autodel_tasks[key] = asyncio.create_task(
-                        _promo_autodel_worker(bot, msg.chat.id, msg.message_id)
-                    )
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    pass
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"[promo_worker] error: {e}")
+
+async def _user_promo_loop(bot: Bot, user_id: int, send_immediately: bool = False):
+    try:
+        if send_immediately:
+            await send_one_random_promo(bot, user_id)
+
+        while True:
+            await asyncio.sleep(PROMO_INTERVAL_SECONDS)
+            if user_promo_loop_tasks.get(user_id) is not asyncio.current_task():
+                return
+            await send_one_random_promo(bot, user_id)
+    except asyncio.CancelledError:
+        return
+
+
+def restart_user_promo_timer(bot: Bot, user_id: int, send_immediately: bool = False):
+    old_task = user_promo_loop_tasks.pop(user_id, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+    user_promo_loop_tasks[user_id] = asyncio.create_task(
+        _user_promo_loop(bot, user_id, send_immediately=send_immediately)
+    )
+
+
+async def init_all_user_promo_timers(bot: Bot):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            rows = await cursor.fetchall()
+    for (uid,) in rows:
+        if uid not in user_promo_loop_tasks:
+            restart_user_promo_timer(bot, uid, send_immediately=False)
 
 
 async def send_screen_with_autodel(
@@ -874,29 +899,34 @@ async def send_coins_gift(sender_id: int, recipient_id: int, amount: int, bot: B
 
 
 async def handle_start(message: Message, command: CommandObject, bot: Bot):
+    user_id = message.from_user.id
     ref_id = None
     if command.args and command.args.isdigit():
         ref_id = int(command.args)
 
     await ensure_user(
-        message.from_user.id,
+        user_id,
         message.from_user.username,
         message.from_user.full_name,
         referrer_id=ref_id,
     )
 
     if command.args and command.args.startswith("shop_"):
+        if user_id not in user_promo_loop_tasks:
+            restart_user_promo_timer(bot, user_id, send_immediately=False)
         item_key = command.args.removeprefix("shop_")
         await process_gift_order(message, item_key, bot)
         return
 
     if command.args and command.args.startswith("gift_"):
+        if user_id not in user_promo_loop_tasks:
+            restart_user_promo_timer(bot, user_id, send_immediately=False)
         parts = command.args.split("_")
         if len(parts) >= 4 and parts[1] == "coins" and parts[2].isdigit() and parts[3].isdigit():
             recipient_id = int(parts[2])
             amount = int(parts[3])
-            ok, msg = await send_coins_gift(message.from_user.id, recipient_id, amount, bot)
-            await message.answer(msg, reply_markup=main_menu_kb(message.from_user.id), parse_mode="HTML")
+            ok, msg = await send_coins_gift(user_id, recipient_id, amount, bot)
+            await message.answer(msg, reply_markup=main_menu_kb(user_id), parse_mode="HTML")
             return
 
         if len(parts) >= 4 and parts[1] == "prem" and parts[2].isdigit():
@@ -915,12 +945,15 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
 
     await send_screen_with_autodel(
         bot,
-        message.from_user.id,
+        user_id,
         message.chat.id,
         "main",
         "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-        main_menu_kb(message.from_user.id),
+        main_menu_kb(user_id),
     )
+
+    # При /start сразу отправляем 1 рандомное промо-сообщение и запускаем таймер 2 часов заново
+    restart_user_promo_timer(bot, user_id, send_immediately=True)
 
 
 async def handle_push_update_cmd(message: Message, bot: Bot):
@@ -1362,12 +1395,14 @@ async def main():
     dp.pre_checkout_query.register(handle_pre_checkout)
     dp.message.register(handle_text_messages, F.text)
 
-    promo_task = asyncio.create_task(_promo_broadcast_worker(bot))
+    await init_all_user_promo_timers(bot)
 
     try:
         await dp.start_polling(bot)
     finally:
-        promo_task.cancel()
+        for task in list(user_promo_loop_tasks.values()):
+            if not task.done():
+                task.cancel()
         for task in list(autodel_tasks.values()):
             if not task.done():
                 task.cancel()
