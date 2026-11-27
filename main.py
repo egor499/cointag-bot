@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import random
 import asyncio
 import aiosqlite
 from urllib.parse import urlencode
@@ -29,7 +30,7 @@ DB_PATH = os.environ.get("DB_PATH", "bot.db")
 # Ссылка на твоё веб-приложение (Mini App) магазина (обязательно https://)
 SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
 
-# Курс: 1 звезда = 100 коинов
+# Курс: 1 звезда = 25 коинов
 COINS_PER_STAR = 25
 
 # Тарифы премиума (используются и для покупки себе, и для подарка другу за звёзды)
@@ -68,6 +69,8 @@ BONUS_COINS = 5
 BONUS_COOLDOWN = 86400
 REF_BONUS_COINS = 15
 AUTO_DELETE_SECONDS = 60
+PROMO_INTERVAL_SECONDS = 2 * 3600  # 2 часа (7200 секунд)
+PROMO_DELETE_SECONDS = 4 * 3600    # 4 часа (14400 секунд)
 
 # Временное состояние для выбора подарка / суммы / действий админа
 pending_gift_state: dict[int, dict] = {}
@@ -76,6 +79,10 @@ pending_admin_action: dict[int, str] = {}
 # Кэш активного экрана и активные таймеры автоудаления/автообновления на пользователя
 active_screen_cache: dict[int, dict] = {}
 autodel_tasks: dict[int, asyncio.Task] = {}
+
+# Кэш и таймеры автоудаления промо-сообщений (удаляются через 4 часа без переоткрытия)
+active_promo_cache: dict[tuple[int, int], dict] = {}
+promo_autodel_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 
 def make_btn(text: str, style: str | None = None, **kwargs) -> InlineKeyboardButton:
@@ -117,6 +124,51 @@ def build_shop_webapp_url(user_id: int, coins: int, bot_username: str = "LarplBo
         }
     )
     return f"{SHOP_WEBAPP_URL}{sep}{params}"
+
+
+def build_promo_messages(user_id: int, coins: int, bot_username: str) -> list[tuple[str, InlineKeyboardMarkup]]:
+    shop_url = build_shop_webapp_url(user_id, coins, bot_username)
+    bot_link = f"https://t.me/{bot_username}?start=promo"
+
+    return [
+        (
+            "🎁 <b>Выбирай, какой подарок хочешь 👇</b>\n\n"
+            "<blockquote>"
+            "⭐ 1000 звёзд\n"
+            "👑 Telegram Premium на 12 месяцев\n"
+            "🎁 NFT-подарок"
+            "</blockquote>",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [make_btn("💎 Выбрать подарок", style="primary", web_app=WebAppInfo(url=shop_url))]
+                ]
+            ),
+        ),
+        (
+            "✅ <b>Всё готово — ваши подарки ждут! 👇</b>",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [make_btn("🎁 Забрать", style="success", url=bot_link)]
+                ]
+            ),
+        ),
+        (
+            "🎁 <b>Всё на месте — забирайте свои подарки! 👇</b>",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [make_btn("🎁 Забрать подарки", style="danger", url=bot_link)]
+                ]
+            ),
+        ),
+        (
+            "⏳ <b>Всё готово — но подарки ждут недолго! 👇</b>",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [make_btn("🎁 Успеть забрать", style="primary", url=bot_link)]
+                ]
+            ),
+        ),
+    ]
 
 
 async def init_db():
@@ -548,7 +600,6 @@ async def _autodel_worker(bot: Bot, user_id: int, chat_id: int, message_id: int,
     except Exception as e:
         print(f"[autodel] delete_message failed for user={user_id} msg={message_id}: {e}")
 
-    # Если пользователь уже переключился на другой экран пока шла задержка — не перетираем новый экран
     if user_id in active_screen_cache:
         return
 
@@ -560,6 +611,63 @@ async def _autodel_worker(bot: Bot, user_id: int, chat_id: int, message_id: int,
         await send_screen_with_autodel(bot, user_id, current_chat_id, current_screen, text, kb)
     except Exception as e:
         print(f"[autodel] refresh failed for user={user_id} screen={current_screen}: {e}")
+
+
+async def _promo_autodel_worker(bot: Bot, chat_id: int, message_id: int):
+    key = (chat_id, message_id)
+    try:
+        await asyncio.sleep(PROMO_DELETE_SECONDS)
+    except asyncio.CancelledError:
+        active_promo_cache.pop(key, None)
+        promo_autodel_tasks.pop(key, None)
+        return
+
+    active_promo_cache.pop(key, None)
+    promo_autodel_tasks.pop(key, None)
+
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        print(f"[promo_autodel] delete failed chat={chat_id} msg={message_id}: {e}")
+
+
+async def _promo_broadcast_worker(bot: Bot):
+    while True:
+        await asyncio.sleep(PROMO_INTERVAL_SECONDS)
+        try:
+            bot_info = await bot.get_me()
+            bot_username = bot_info.username or "LarplBot"
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("SELECT user_id, coins FROM users") as cursor:
+                    users = await cursor.fetchall()
+
+            for uid, coins in users:
+                variants = build_promo_messages(uid, coins or 0, bot_username)
+                text, kb = random.choice(variants)
+                try:
+                    msg = await bot.send_message(
+                        chat_id=uid,
+                        text=text,
+                        reply_markup=kb,
+                        parse_mode="HTML",
+                    )
+                    key = (msg.chat.id, msg.message_id)
+                    active_promo_cache[key] = {
+                        "chat_id": msg.chat.id,
+                        "message_id": msg.message_id,
+                        "sent_at": int(time.time()),
+                    }
+                    promo_autodel_tasks[key] = asyncio.create_task(
+                        _promo_autodel_worker(bot, msg.chat.id, msg.message_id)
+                    )
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[promo_worker] error: {e}")
 
 
 async def send_screen_with_autodel(
@@ -1254,12 +1362,19 @@ async def main():
     dp.pre_checkout_query.register(handle_pre_checkout)
     dp.message.register(handle_text_messages, F.text)
 
+    promo_task = asyncio.create_task(_promo_broadcast_worker(bot))
+
     try:
         await dp.start_polling(bot)
     finally:
+        promo_task.cancel()
         for task in list(autodel_tasks.values()):
             if not task.done():
                 task.cancel()
+        for task in list(promo_autodel_tasks.values()):
+            if not task.done():
+                task.cancel()
+        active_promo_cache.clear()
 
 
 if __name__ == "__main__":
