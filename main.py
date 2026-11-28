@@ -2,6 +2,7 @@ import os
 import json
 import time
 import random
+import secrets
 import asyncio
 import aiosqlite
 from urllib.parse import urlencode
@@ -33,6 +34,7 @@ COINS_PER_STAR = 25
 
 FORTUNE_SPIN_STARS = 10
 CASE_OPEN_STARS = 15
+ADMIN_DEFAULT_SPINS = 999
 
 ALLOWED_FORTUNE_COINS = {25, 50}
 ALLOWED_CASE_COINS = {30, 50, 500}
@@ -84,9 +86,6 @@ user_promo_loop_tasks: dict[int, asyncio.Task] = {}
 active_promo_cache: dict[tuple[int, int], dict] = {}
 promo_autodel_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
-# Одноразовые ключи начисления дропа (чтобы нельзя было повторно прокликать старую ссылку claim_)
-pending_reward_claims: dict[tuple[int, str], dict] = {}
-
 
 def make_btn(text: str, style: str | None = None, **kwargs) -> InlineKeyboardButton:
     if style:
@@ -104,6 +103,8 @@ def is_admin(user_id: int | None) -> bool:
 def is_premium_active(user: dict | None) -> bool:
     if not user:
         return False
+    if is_admin(user.get("user_id")):
+        return True
     if user.get("premium_forever"):
         return True
     now_ts = int(time.time())
@@ -111,6 +112,8 @@ def is_premium_active(user: dict | None) -> bool:
 
 
 def format_premium_status(user: dict) -> str:
+    if is_admin(user.get("user_id")):
+        return "ADMIN / PREMIUM 👑"
     if user.get("premium_forever"):
         return "PREMIUM НАВСЕГДА 👑"
     now_ts = int(time.time())
@@ -121,18 +124,21 @@ def format_premium_status(user: dict) -> str:
 
 
 def build_shop_webapp_url(user: dict, bot_username: str = "LarplBot") -> str:
+    uid = int(user["user_id"])
+    admin_flag = 1 if is_admin(uid) else 0
     has_prem = 1 if is_premium_active(user) else 0
-    spins = int(user.get("fortune_spins") or 0)
-    cases = int(user.get("case_opens") or 0)
-    coins = int(user.get("coins") or 0)
+    spins = ADMIN_DEFAULT_SPINS if admin_flag else max(0, int(user.get("fortune_spins") or 0))
+    cases = max(0, int(user.get("case_opens") or 0))
+    coins = max(0, int(user.get("coins") or 0))
 
     sep = "&" if "?" in SHOP_WEBAPP_URL else "?"
     params = urlencode(
         {
-            "user_id": user["user_id"],
+            "user_id": uid,
             "coins": coins,
             "rate": COINS_PER_STAR,
             "has_premium": has_prem,
+            "is_admin": admin_flag,
             "spins": spins,
             "cases": cases,
             "bot": bot_username,
@@ -234,7 +240,25 @@ async def init_db():
             )
             """
         )
-        # Миграция для существующей таблицы users
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS used_promos (
+                user_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                used_at INTEGER,
+                PRIMARY KEY (user_id, code)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS claimed_rewards (
+                claim_key TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                claimed_at INTEGER NOT NULL
+            )
+            """
+        )
         cursor = await db.execute("PRAGMA table_info(users)")
         cols = {row[1] for row in await cursor.fetchall()}
         if "fortune_spins" not in cols:
@@ -257,6 +281,7 @@ async def ensure_user(
     full_name: str | None = None,
     referrer_id: int | None = None,
 ):
+    init_spins = ADMIN_DEFAULT_SPINS if is_admin(user_id) else 0
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT user_id, referrer_id FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
@@ -265,10 +290,10 @@ async def ensure_user(
             valid_ref = referrer_id if (referrer_id and referrer_id != user_id) else None
             await db.execute(
                 """
-                INSERT INTO users (user_id, username, full_name, coins, referrer_id)
-                VALUES (?, ?, ?, 10, ?)
+                INSERT INTO users (user_id, username, full_name, coins, referrer_id, fortune_spins, case_opens)
+                VALUES (?, ?, ?, 10, ?, ?, 0)
                 """,
-                (user_id, username, full_name, valid_ref),
+                (user_id, username, full_name, valid_ref, init_spins),
             )
             if valid_ref:
                 ref_cur = await db.execute(
@@ -278,7 +303,7 @@ async def ensure_user(
                 ref_row = await ref_cur.fetchone()
                 if ref_row:
                     now_ts = int(time.time())
-                    is_ref_prem = bool(ref_row[1]) or (ref_row[0] and ref_row[0] > now_ts)
+                    is_ref_prem = is_admin(valid_ref) or bool(ref_row[1]) or (ref_row[0] and ref_row[0] > now_ts)
                     reward = REF_BONUS_COINS * (2 if is_ref_prem else 1)
                     await db.execute(
                         """
@@ -290,15 +315,27 @@ async def ensure_user(
                     )
             await db.commit()
         else:
-            await db.execute(
-                """
-                UPDATE users
-                SET username = COALESCE(?, username),
-                    full_name = COALESCE(?, full_name)
-                WHERE user_id = ?
-                """,
-                (username, full_name, user_id),
-            )
+            if is_admin(user_id):
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET username = COALESCE(?, username),
+                        full_name = COALESCE(?, full_name),
+                        fortune_spins = CASE WHEN COALESCE(fortune_spins, 0) < ? THEN ? ELSE fortune_spins END
+                    WHERE user_id = ?
+                    """,
+                    (username, full_name, ADMIN_DEFAULT_SPINS, ADMIN_DEFAULT_SPINS, user_id),
+                )
+            else:
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET username = COALESCE(?, username),
+                        full_name = COALESCE(?, full_name)
+                    WHERE user_id = ?
+                    """,
+                    (username, full_name, user_id),
+                )
             await db.commit()
 
 
@@ -326,6 +363,20 @@ async def cleanup_expired_premiums_db():
         await db.commit()
 
 
+async def consume_claim_token_once(user_id: int, token: str) -> bool:
+    clean_token = "".join(ch for ch in (token or "") if ch.isalnum() or ch in ("_", "-"))[:64]
+    if not clean_token:
+        return False
+    claim_key = f"{user_id}:{clean_token}"
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO claimed_rewards (claim_key, user_id, claimed_at) VALUES (?, ?, ?)",
+            (claim_key, user_id, int(time.time())),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
 async def add_coins(target_user_id: int, delta: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT coins FROM users WHERE user_id = ?", (target_user_id,))
@@ -333,8 +384,8 @@ async def add_coins(target_user_id: int, delta: int):
         if not row:
             initial = max(0, 10 + delta)
             await db.execute(
-                "INSERT INTO users (user_id, coins) VALUES (?, ?)",
-                (target_user_id, initial),
+                "INSERT INTO users (user_id, coins, fortune_spins, case_opens) VALUES (?, ?, ?, 0)",
+                (target_user_id, initial, ADMIN_DEFAULT_SPINS if is_admin(target_user_id) else 0),
             )
         else:
             new_balance = max(0, (row[0] or 0) + delta)
@@ -349,7 +400,7 @@ async def add_fortune_spins(user_id: int, count: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET fortune_spins = COALESCE(fortune_spins, 0) + ? WHERE user_id = ?",
-            (count, user_id),
+            (max(0, count), user_id),
         )
         await db.commit()
 
@@ -358,7 +409,7 @@ async def add_case_opens(user_id: int, count: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET case_opens = COALESCE(case_opens, 0) + ? WHERE user_id = ?",
-            (count, user_id),
+            (max(0, count), user_id),
         )
         await db.commit()
 
@@ -373,8 +424,8 @@ async def grant_premium(target_user_id: int, tariff_key: str):
         row = await cur.fetchone()
         if not row:
             await db.execute(
-                "INSERT INTO users (user_id, coins) VALUES (?, 10)",
-                (target_user_id,),
+                "INSERT INTO users (user_id, coins, fortune_spins, case_opens) VALUES (?, 10, ?, 0)",
+                (target_user_id, ADMIN_DEFAULT_SPINS if is_admin(target_user_id) else 0),
             )
             current_until = 0
             current_forever = 0
@@ -538,14 +589,17 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
     if not user:
         return None
 
+    spins_val = ADMIN_DEFAULT_SPINS if is_admin(user_id) else int(user.get("fortune_spins") or 0)
+    cases_val = int(user.get("case_opens") or 0)
+
     if screen == "profile":
         text = (
             "👤 <b>Твой профиль</b>\n\n"
             f"🆔 ID: <code>{user['user_id']}</code>\n"
             f"🏅 Статус: <b>{format_premium_status(user)}</b>\n"
             f"🪙 Баланс: <b>{user['coins']} CoinTag</b>\n"
-            f"🎡 Круток фортуны: <b>{user.get('fortune_spins') or 0}</b>\n"
-            f"📦 Открытий кейса: <b>{user.get('case_opens') or 0}</b>\n"
+            f"🎡 Круток фортуны: <b>{spins_val}</b>\n"
+            f"📦 Открытий кейса: <b>{cases_val}</b>\n"
             f"👥 Приглашено друзей: <b>{user['referrals_count']}</b>"
         )
         return text, back_menu_kb(user_id)
@@ -964,6 +1018,27 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
     )
     await cleanup_expired_premiums_db()
 
+    if args == "admin_free_spins" and is_admin(user_id):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET fortune_spins = ? WHERE user_id = ?",
+                (ADMIN_DEFAULT_SPINS, user_id),
+            )
+            await db.commit()
+        user = await get_user(user_id)
+        bot_info = await bot.get_me()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [make_btn("🎰 Открыть Mini App", style="success", web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot")))]
+            ]
+        )
+        await message.answer(
+            f"⚡ Админу начислено <b>{ADMIN_DEFAULT_SPINS}</b> бесплатных круток фортуны!",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        return
+
     if args == "buy_fortune":
         await message.answer_invoice(
             title="Крутка колеса фортуны",
@@ -984,21 +1059,14 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
         )
         return
 
-    if args.startswith("claim_coins_"):
-        # Формат: claim_coins_<AMOUNT>_from_<source>
-        parts = args.split("_")
-        if len(parts) >= 5 and parts[2].isdigit():
-            amount = int(parts[2])
-            source = "_".join(parts[4:])
-            allowed = False
-            if source == "fortune" and amount in ALLOWED_FORTUNE_COINS:
-                allowed = True
-            elif source == "case" and amount in ALLOWED_CASE_COINS:
-                allowed = True
-            elif source == "promo" and amount == PROMO_SUPER_COINS:
-                allowed = True
-
-            if allowed:
+    # Начисление CoinTag с колеса фортуны (claim_f_<AMOUNT>_<TOKEN>)
+    if args.startswith("claim_f_"):
+        rest = args.removeprefix("claim_f_")
+        parts = rest.split("_", 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            amount = int(parts[0])
+            token = parts[1]
+            if amount in ALLOWED_FORTUNE_COINS and await consume_claim_token_once(user_id, token):
                 await add_coins(user_id, amount)
                 updated = await get_user(user_id)
                 await send_screen_with_autodel(
@@ -1006,14 +1074,66 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
                     user_id,
                     message.chat.id,
                     "main",
-                    f"🪙 Получено <b>{amount} CoinTag</b>!\nТекущий баланс: <b>{updated['coins']} CoinTag</b>.",
+                    f"🪙 Получено <b>{amount} CoinTag</b> с колеса фортуны!\nТекущий баланс: <b>{updated['coins']} CoinTag</b>.",
                     main_menu_kb(user_id),
                 )
                 return
 
-    if args.startswith("claim_bear_from_"):
-        source = args.removeprefix("claim_bear_from_")
-        if source in ("fortune", "case"):
+    # Начисление CoinTag из кейса (claim_c_<AMOUNT>_<TOKEN>)
+    if args.startswith("claim_c_"):
+        rest = args.removeprefix("claim_c_")
+        parts = rest.split("_", 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            amount = int(parts[0])
+            token = parts[1]
+            if amount in ALLOWED_CASE_COINS and await consume_claim_token_once(user_id, token):
+                await add_coins(user_id, amount)
+                updated = await get_user(user_id)
+                await send_screen_with_autodel(
+                    bot,
+                    user_id,
+                    message.chat.id,
+                    "main",
+                    f"🪙 Получено <b>{amount} CoinTag</b> из кейса!\nТекущий баланс: <b>{updated['coins']} CoinTag</b>.",
+                    main_menu_kb(user_id),
+                )
+                return
+
+    # Начисление CoinTag за промокод SUPER (claim_p_<AMOUNT>_<UID>_SUPER)
+    if args.startswith("claim_p_"):
+        rest = args.removeprefix("claim_p_")
+        parts = rest.split("_")
+        if len(parts) >= 3 and parts[0].isdigit() and int(parts[0]) == PROMO_SUPER_COINS and parts[-1] == "SUPER":
+            token = f"promo_SUPER_{user_id}"
+            if await consume_claim_token_once(user_id, token):
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cur = await db.execute(
+                        "SELECT 1 FROM used_promos WHERE user_id = ? AND code = ?",
+                        (user_id, "SUPER"),
+                    )
+                    if not await cur.fetchone():
+                        await db.execute(
+                            "INSERT INTO used_promos (user_id, code, used_at) VALUES (?, ?, ?)",
+                            (user_id, "SUPER", int(time.time())),
+                        )
+                        await db.commit()
+                await add_coins(user_id, PROMO_SUPER_COINS)
+                updated = await get_user(user_id)
+                await send_screen_with_autodel(
+                    bot,
+                    user_id,
+                    message.chat.id,
+                    "main",
+                    f"🎟 Промокод <b>SUPER</b> активирован! Получено <b>+{PROMO_SUPER_COINS} CoinTag</b>.\n"
+                    f"Текущий баланс: <b>{updated['coins']} CoinTag</b>.",
+                    main_menu_kb(user_id),
+                )
+                return
+
+    # Заявка на вывод мишки по кнопке "Забрать" (claimbear_f_<TOKEN> или claimbear_c_<TOKEN>)
+    if args.startswith("claimbear_f_") or args.startswith("claimbear_c_"):
+        token = args.split("_", 2)[2] if len(args.split("_", 2)) == 3 else ""
+        if token and await consume_claim_token_once(user_id, f"bear_{token}"):
             await process_gift_order(message, "bear", bot, charge_coins=False)
             return
 
@@ -1294,13 +1414,14 @@ async def handle_successful_payment(message: Message, bot: Bot):
         await add_fortune_spins(user_id, 1)
         user = await get_user(user_id)
         bot_info = await bot.get_me()
+        spins_cnt = ADMIN_DEFAULT_SPINS if is_admin(user_id) else int(user.get("fortune_spins") or 1)
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [make_btn("🎰 Открыть Mini App", style="success", web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot")))]
             ]
         )
         await message.answer(
-            f"✅ Оплата прошла! Начислена <b>1 крутка</b> колеса фортуны (доступно: <b>{user.get('fortune_spins') or 1}</b>).\n"
+            f"✅ Оплата прошла! Начислена <b>1 крутка</b> колеса фортуны (доступно: <b>{spins_cnt}</b>).\n"
             "Нажми кнопку ниже и запусти открытие вручную.",
             reply_markup=kb,
             parse_mode="HTML",
