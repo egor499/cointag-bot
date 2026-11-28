@@ -27,6 +27,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "6163599367"))
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@LarpLiveChan")
+
 SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
 APP_BUILD_REV = os.environ.get("APP_BUILD_REV", "2026_11_28_v2")
 
@@ -248,7 +250,8 @@ async def init_db():
                 referrer_id INTEGER,
                 referrals_count INTEGER DEFAULT 0,
                 fortune_spins INTEGER DEFAULT 0,
-                case_opens INTEGER DEFAULT 0
+                case_opens INTEGER DEFAULT 0,
+                welcome_spin_claimed INTEGER DEFAULT 0
             )
             """
         )
@@ -289,6 +292,8 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN fortune_spins INTEGER DEFAULT 0")
         if "case_opens" not in cols:
             await db.execute("ALTER TABLE users ADD COLUMN case_opens INTEGER DEFAULT 0")
+        if "welcome_spin_claimed" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN welcome_spin_claimed INTEGER DEFAULT 0")
         await db.commit()
 
 
@@ -304,7 +309,8 @@ async def ensure_user(
     username: str | None = None,
     full_name: str | None = None,
     referrer_id: int | None = None,
-):
+) -> bool:
+    """Возвращает True, если пользователь зарегистрирован впервые."""
     init_spins = ADMIN_INFINITE_COUNT if is_admin(user_id) else 0
     init_cases = ADMIN_INFINITE_COUNT if is_admin(user_id) else 0
     async with aiosqlite.connect(DB_PATH) as db:
@@ -315,8 +321,11 @@ async def ensure_user(
             valid_ref = referrer_id if (referrer_id and referrer_id != user_id) else None
             await db.execute(
                 """
-                INSERT INTO users (user_id, username, full_name, coins, referrer_id, fortune_spins, case_opens)
-                VALUES (?, ?, ?, 10, ?, ?, ?)
+                INSERT INTO users (
+                    user_id, username, full_name, coins, referrer_id,
+                    fortune_spins, case_opens, welcome_spin_claimed
+                )
+                VALUES (?, ?, ?, 10, ?, ?, ?, 0)
                 """,
                 (user_id, username, full_name, valid_ref, init_spins, init_cases),
             )
@@ -339,6 +348,7 @@ async def ensure_user(
                         (reward, valid_ref),
                     )
             await db.commit()
+            return True
         else:
             if is_admin(user_id):
                 await db.execute(
@@ -363,6 +373,7 @@ async def ensure_user(
                     (username, full_name, user_id),
                 )
             await db.commit()
+            return False
 
 
 async def get_user(user_id: int):
@@ -373,6 +384,63 @@ async def get_user(user_id: int):
             return None
         cols = [col[0] for col in cursor.description]
         return dict(zip(cols, row))
+
+
+async def is_subscribed_to_channel(bot: Bot, user_id: int) -> bool:
+    channel = CHANNEL_USERNAME.strip()
+    if not channel:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+        return member.status in {"member", "administrator", "creator"}
+    except Exception as e:
+        print(f"[sub_check] failed for channel={channel} user={user_id}: {e}")
+        return False
+
+
+async def try_claim_welcome_spin(bot: Bot, user_id: int) -> tuple[bool, str]:
+    user = await get_user(user_id)
+    if not user:
+        return False, "Профиль не найден. Напиши /start."
+    if int(user.get("welcome_spin_claimed") or 0) == 1:
+        return False, "Ты уже получил приветственную крутку!"
+    if not await is_subscribed_to_channel(bot, user_id):
+        return False, f"Подпишись на канал {CHANNEL_USERNAME} и нажми «✅ Я подписался»."
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE users
+            SET welcome_spin_claimed = 1,
+                fortune_spins = CASE WHEN ? = 1 THEN fortune_spins ELSE COALESCE(fortune_spins, 0) + 1 END
+            WHERE user_id = ? AND COALESCE(welcome_spin_claimed, 0) = 0
+            """,
+            (1 if is_admin(user_id) else 0, user_id),
+        )
+        await db.commit()
+        if cur.rowcount == 0:
+            return False, "Ты уже получил приветственную крутку!"
+
+    return True, "🎉 Поздравляю! Тебе начислена <b>1 крутка колеса фортуны</b>!"
+
+
+def welcome_spin_offer_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [make_btn("🎁 Получить", style="success", callback_data="wspin:open_sub")]
+        ]
+    )
+
+
+def welcome_spin_sub_kb() -> InlineKeyboardMarkup:
+    clean_username = CHANNEL_USERNAME.lstrip("@")
+    channel_url = f"https://t.me/{clean_username}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [make_btn(f"📢 Подписаться на {CHANNEL_USERNAME}", style="primary", url=channel_url)],
+            [make_btn("✅ Я подписался", style="success", callback_data="wspin:check")],
+        ]
+    )
 
 
 async def cleanup_expired_premiums_db():
@@ -1071,7 +1139,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
     args = (command.args or "").strip()
     ref_id = int(args) if args.isdigit() else None
 
-    await ensure_user(
+    is_first_visit = await ensure_user(
         user_id,
         message.from_user.username,
         message.from_user.full_name,
@@ -1128,16 +1196,63 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
                 )
                 return
 
-    await send_screen_with_autodel(
-        bot,
-        user_id,
-        message.chat.id,
-        "main",
-        "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-        main_menu_kb(user_id),
-    )
+    if is_first_visit:
+        await message.answer(
+            "🎡 <b>ВАМ ДОСТУПНА 1 КРУТКА</b>",
+            reply_markup=welcome_spin_offer_kb(),
+            parse_mode="HTML",
+        )
+    else:
+        await send_screen_with_autodel(
+            bot,
+            user_id,
+            message.chat.id,
+            "main",
+            "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
+            main_menu_kb(user_id),
+        )
 
     restart_user_promo_timer(bot, user_id, send_immediately=True)
+
+
+async def handle_welcome_spin_callbacks(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+    await ensure_user(user_id, callback.from_user.username, callback.from_user.full_name)
+    action = callback.data.split(":", 1)[1]
+
+    if action == "open_sub":
+        user = await get_user(user_id)
+        if user and int(user.get("welcome_spin_claimed") or 0) == 1:
+            await callback.answer("Ты уже забрал приветственную крутку!", show_alert=True)
+            return
+        await callback.message.edit_text(
+            f"🎁 <b>Чтобы получить подарок (1 крутку), подпишись на канал {CHANNEL_USERNAME}:</b>",
+            reply_markup=welcome_spin_sub_kb(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    if action == "check":
+        ok, msg = await try_claim_welcome_spin(bot, user_id)
+        if not ok:
+            await callback.answer(msg, show_alert=True)
+            return
+
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+        await callback.answer("🎡 +1 крутка получена!", show_alert=False)
+        await send_screen_with_autodel(
+            bot,
+            user_id,
+            callback.message.chat.id,
+            "main",
+            f"{msg}\n\nЗаглядывай в <b>Магазин</b> 🛒 и крути колесо!",
+            main_menu_kb(user_id),
+        )
 
 
 async def handle_push_update_cmd(message: Message, bot: Bot):
@@ -1746,6 +1861,7 @@ async def main():
     dp.message.register(handle_users_shared, F.users_shared)
     dp.message.register(handle_successful_payment, F.successful_payment)
 
+    dp.callback_query.register(handle_welcome_spin_callbacks, F.data.startswith("wspin:"))
     dp.callback_query.register(handle_menu_callbacks, F.data.startswith("menu:"))
     dp.callback_query.register(handle_admin_callbacks, F.data.startswith("adm:"))
     dp.callback_query.register(handle_buy_prem, F.data.startswith("buy_prem:"))
