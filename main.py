@@ -1206,15 +1206,15 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
             reply_markup=welcome_spin_offer_kb(),
             parse_mode="HTML",
         )
-    else:
-        await send_screen_with_autodel(
-            bot,
-            user_id,
-            message.chat.id,
-            "main",
-            "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-            main_menu_kb(user_id),
-        )
+
+    await send_screen_with_autodel(
+        bot,
+        user_id,
+        message.chat.id,
+        "main",
+        "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
+        main_menu_kb(user_id),
+    )
 
     restart_user_promo_timer(bot, user_id, send_immediately=True)
 
