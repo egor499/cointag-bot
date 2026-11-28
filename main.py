@@ -431,10 +431,19 @@ async def add_fortune_spins(user_id: int, count: int):
     if is_admin(user_id):
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET fortune_spins = COALESCE(fortune_spins, 0) + ? WHERE user_id = ?",
-            (max(0, count), user_id),
-        )
+        cur = await db.execute("SELECT fortune_spins FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute(
+                "INSERT INTO users (user_id, coins, fortune_spins, case_opens) VALUES (?, 10, ?, 0)",
+                (user_id, max(0, count)),
+            )
+        else:
+            new_val = max(0, int(row[0] or 0) + count)
+            await db.execute(
+                "UPDATE users SET fortune_spins = ? WHERE user_id = ?",
+                (new_val, user_id),
+            )
         await db.commit()
 
 
@@ -442,10 +451,19 @@ async def add_case_opens(user_id: int, count: int):
     if is_admin(user_id):
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET case_opens = COALESCE(case_opens, 0) + ? WHERE user_id = ?",
-            (max(0, count), user_id),
-        )
+        cur = await db.execute("SELECT case_opens FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute(
+                "INSERT INTO users (user_id, coins, fortune_spins, case_opens) VALUES (?, 10, 0, ?)",
+                (user_id, max(0, count)),
+            )
+        else:
+            new_val = max(0, int(row[0] or 0) + count)
+            await db.execute(
+                "UPDATE users SET case_opens = ? WHERE user_id = ?",
+                (new_val, user_id),
+            )
         await db.commit()
 
 
@@ -522,6 +540,10 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
             [
                 make_btn("🪙 Выдать/снять коины", style="success", callback_data="adm:coins"),
                 make_btn("👑 Выдать Премиум 30д", style="success", callback_data="adm:prem30"),
+            ],
+            [
+                make_btn("🎡 Выдать крутки", style="primary", callback_data="adm:spins"),
+                make_btn("📦 Выдать кейсы", style="primary", callback_data="adm:cases"),
             ],
             [make_btn("⬅️ В меню", style="danger", callback_data="menu:main")],
         ]
@@ -1281,6 +1303,30 @@ async def handle_admin_callbacks(callback: CallbackQuery, bot: Bot):
         await callback.answer()
         return
 
+    if sub == "spins":
+        pending_admin_action[uid] = "spins"
+        await callback.message.edit_text(
+            "🎡 <b>Выдача круток колеса фортуны</b>\n\n"
+            "Отправь сообщение в формате:\n<code>USER_ID КОЛ-ВО</code>\n"
+            "Например: <code>123456789 1</code> или <code>123456789 3</code>",
+            reply_markup=admin_panel_kb(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    if sub == "cases":
+        pending_admin_action[uid] = "cases"
+        await callback.message.edit_text(
+            "📦 <b>Выдача открытий кейса</b>\n\n"
+            "Отправь сообщение в формате:\n<code>USER_ID КОЛ-ВО</code>\n"
+            "Например: <code>123456789 1</code> или <code>123456789 2</code>",
+            reply_markup=admin_panel_kb(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
 
 async def handle_buy_prem(callback: CallbackQuery):
     tariff_key = callback.data.split(":", 1)[1]
@@ -1488,6 +1534,58 @@ async def handle_admin_text_input(message: Message, bot: Bot) -> bool:
             )
         except Exception:
             pass
+        return True
+
+    if action in ("spins", "cases"):
+        parts = raw.split()
+        if len(parts) == 1 and parts[0].isdigit():
+            target_id = int(parts[0])
+            count = 1
+        elif len(parts) == 2 and parts[0].isdigit() and parts[1].lstrip("-").isdigit():
+            target_id = int(parts[0])
+            count = int(parts[1])
+        else:
+            await message.answer(
+                "❌ Неверный формат. Нужно: <code>USER_ID КОЛ-ВО</code> (например, <code>123456789 1</code>)",
+                reply_markup=admin_panel_kb(),
+                parse_mode="HTML",
+            )
+            return True
+
+        if action == "spins":
+            await add_fortune_spins(target_id, count)
+            updated = await get_user(target_id)
+            spins_now = "∞" if is_admin(target_id) else str(int((updated or {}).get("fortune_spins") or 0))
+            await message.answer(
+                f"✅ Крутки колеса для <code>{target_id}</code> изменены на <b>{count:+d}</b>. Теперь доступно: <b>{spins_now}</b>.",
+                reply_markup=admin_panel_kb(),
+                parse_mode="HTML",
+            )
+            try:
+                await bot.send_message(
+                    target_id,
+                    f"🎡 Администратор выдал тебе <b>{count:+d}</b> круток колеса фортуны! Теперь доступно: <b>{spins_now}</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        else:
+            await add_case_opens(target_id, count)
+            updated = await get_user(target_id)
+            cases_now = "∞" if is_admin(target_id) else str(int((updated or {}).get("case_opens") or 0))
+            await message.answer(
+                f"✅ Открытия кейса для <code>{target_id}</code> изменены на <b>{count:+d}</b>. Теперь доступно: <b>{cases_now}</b>.",
+                reply_markup=admin_panel_kb(),
+                parse_mode="HTML",
+            )
+            try:
+                await bot.send_message(
+                    target_id,
+                    f"📦 Администратор выдал тебе <b>{count:+d}</b> открытий кейса! Теперь доступно: <b>{cases_now}</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
         return True
 
     return False
