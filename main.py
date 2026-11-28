@@ -402,24 +402,28 @@ async def try_claim_welcome_spin(bot: Bot, user_id: int) -> tuple[bool, str]:
     user = await get_user(user_id)
     if not user:
         return False, "Профиль не найден. Напиши /start."
-    if int(user.get("welcome_spin_claimed") or 0) == 1:
+
+    admin_mode = is_admin(user_id)
+    if not admin_mode and int(user.get("welcome_spin_claimed") or 0) == 1:
         return False, "Ты уже получил приветственную крутку!"
+
     if not await is_subscribed_to_channel(bot, user_id):
         return False, f"Подпишись на канал {CHANNEL_USERNAME} и нажми «✅ Я подписался»."
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            UPDATE users
-            SET welcome_spin_claimed = 1,
-                fortune_spins = CASE WHEN ? = 1 THEN fortune_spins ELSE COALESCE(fortune_spins, 0) + 1 END
-            WHERE user_id = ? AND COALESCE(welcome_spin_claimed, 0) = 0
-            """,
-            (1 if is_admin(user_id) else 0, user_id),
-        )
-        await db.commit()
-        if cur.rowcount == 0:
-            return False, "Ты уже получил приветственную крутку!"
+    if not admin_mode:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                """
+                UPDATE users
+                SET welcome_spin_claimed = 1,
+                    fortune_spins = COALESCE(fortune_spins, 0) + 1
+                WHERE user_id = ? AND COALESCE(welcome_spin_claimed, 0) = 0
+                """,
+                (user_id,),
+            )
+            await db.commit()
+            if cur.rowcount == 0:
+                return False, "Ты уже получил приветственную крутку!"
 
     return True, "🎉 Поздравляю! Тебе начислена <b>1 крутка колеса фортуны</b>!"
 
@@ -1196,7 +1200,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
                 )
                 return
 
-    if is_first_visit:
+    if is_first_visit or is_admin(user_id):
         await message.answer(
             "🎡 <b>ВАМ ДОСТУПНА 1 КРУТКА</b>",
             reply_markup=welcome_spin_offer_kb(),
@@ -1222,7 +1226,7 @@ async def handle_welcome_spin_callbacks(callback: CallbackQuery, bot: Bot):
 
     if action == "open_sub":
         user = await get_user(user_id)
-        if user and int(user.get("welcome_spin_claimed") or 0) == 1:
+        if not is_admin(user_id) and user and int(user.get("welcome_spin_claimed") or 0) == 1:
             await callback.answer("Ты уже забрал приветственную крутку!", show_alert=True)
             return
         await callback.message.edit_text(
