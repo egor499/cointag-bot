@@ -30,7 +30,7 @@ DB_PATH = os.environ.get("DB_PATH", "bot.db")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@LarpLiveChan")
 
 SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
-APP_BUILD_REV = os.environ.get("APP_BUILD_REV", "2026_11_28_v3")
+APP_BUILD_REV = os.environ.get("APP_BUILD_REV", "2026_11_28_v4")
 
 COINS_PER_STAR = 25
 
@@ -138,6 +138,10 @@ def build_shop_webapp_url(
     cases = ADMIN_INFINITE_COUNT if admin_flag else max(0, int(user.get("case_opens") or 0))
     coins = max(0, int(user.get("coins") or 0))
 
+    normalized_tab = (target_tab or "").strip().lower()
+    if normalized_tab in ("cases", "case", "wheel", "fortune"):
+        normalized_tab = "slots"
+
     query_data = {
         "user_id": uid,
         "coins": coins,
@@ -164,16 +168,17 @@ def build_shop_webapp_url(
             ensure_ascii=False,
         ),
     }
-    if target_tab:
-        query_data["tab"] = target_tab
-        query_data["screen"] = target_tab
-        query_data["page"] = target_tab
+    if normalized_tab:
+        query_data["tab"] = normalized_tab
+        query_data["screen"] = normalized_tab
+        query_data["page"] = normalized_tab
+        query_data["section"] = normalized_tab
 
-    base_url = SHOP_WEBAPP_URL.strip()
+    base_url = SHOP_WEBAPP_URL.split("#", 1)[0].strip()
     sep = "&" if "?" in base_url else "?"
     url = f"{base_url}{sep}{urlencode(query_data)}"
-    if target_tab:
-        url = f"{url}#{target_tab}"
+    if normalized_tab:
+        url = f"{url}#{normalized_tab}"
     return url
 
 
@@ -598,7 +603,7 @@ def main_menu_kb(
     uid = user_id if user_id is not None else (user.get("user_id") if user else None)
     profile_user = user or {"user_id": uid or 0, "coins": 0, "fortune_spins": 0, "case_opens": 0}
 
-    cases_url = build_shop_webapp_url(profile_user, bot_username, "menu_cases", target_tab="cases")
+    cases_url = build_shop_webapp_url(profile_user, bot_username, "menu_cases", target_tab="slots")
     shop_url = build_shop_webapp_url(profile_user, bot_username, "menu_shop", target_tab="shop")
 
     rows = [
@@ -1557,7 +1562,7 @@ async def handle_successful_payment(message: Message, bot: Bot):
                     make_btn(
                         "🎰 Открыть Mini App",
                         style="success",
-                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "after_spin_pay", "wheel")),
+                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "after_spin_pay", "slots")),
                     )
                 ]
             ]
@@ -1579,7 +1584,7 @@ async def handle_successful_payment(message: Message, bot: Bot):
                     make_btn(
                         "📦 Открыть Mini App",
                         style="success",
-                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "after_case_pay", "cases")),
+                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "after_case_pay", "slots")),
                     )
                 ]
             ]
