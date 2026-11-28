@@ -28,6 +28,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "6163599367"))
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
 SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
+APP_BUILD_REV = os.environ.get("APP_BUILD_REV", "2026_11_28_v2")
 
 COINS_PER_STAR = 25
 
@@ -122,7 +123,7 @@ def format_premium_status(user: dict) -> str:
     return "Базовый"
 
 
-def build_shop_webapp_url(user: dict, bot_username: str = "LarplBot") -> str:
+def build_shop_webapp_url(user: dict, bot_username: str = "LarplBot", source_tag: str = "app") -> str:
     uid = int(user["user_id"])
     admin_flag = 1 if is_admin(uid) else 0
     has_prem = 1 if is_premium_active(user) else 0
@@ -130,7 +131,8 @@ def build_shop_webapp_url(user: dict, bot_username: str = "LarplBot") -> str:
     cases = ADMIN_INFINITE_COUNT if admin_flag else max(0, int(user.get("case_opens") or 0))
     coins = max(0, int(user.get("coins") or 0))
 
-    sep = "&" if "?" in SHOP_WEBAPP_URL else "?"
+    base_url = SHOP_WEBAPP_URL.strip()
+    sep = "&" if "?" in base_url else "?"
     params = urlencode(
         {
             "user_id": uid,
@@ -141,6 +143,8 @@ def build_shop_webapp_url(user: dict, bot_username: str = "LarplBot") -> str:
             "spins": spins,
             "cases": cases,
             "bot": bot_username,
+            "src": source_tag,
+            "rev": APP_BUILD_REV,
             "v": int(time.time()),
             "items": json.dumps(
                 [
@@ -157,13 +161,10 @@ def build_shop_webapp_url(user: dict, bot_username: str = "LarplBot") -> str:
             ),
         }
     )
-    return f"{SHOP_WEBAPP_URL}{sep}{params}"
+    return f"{base_url}{sep}{params}"
 
 
 def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, InlineKeyboardMarkup]]:
-    shop_url = build_shop_webapp_url(user, bot_username)
-    webapp = WebAppInfo(url=shop_url)
-
     return [
         (
             "🎁 <b>Выбирай, какой подарок хочешь 👇</b>\n\n"
@@ -174,7 +175,13 @@ def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, Inlin
             "</blockquote>",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [make_btn("💎 Выбрать подарок", style="primary", web_app=webapp)]
+                    [
+                        make_btn(
+                            "💎 Выбрать подарок",
+                            style="primary",
+                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_1")),
+                        )
+                    ]
                 ]
             ),
         ),
@@ -182,7 +189,13 @@ def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, Inlin
             "✅ <b>Всё готово — ваши подарки ждут! 👇</b>",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [make_btn("🎁 Забрать", style="success", web_app=webapp)]
+                    [
+                        make_btn(
+                            "🎁 Забрать",
+                            style="success",
+                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_2")),
+                        )
+                    ]
                 ]
             ),
         ),
@@ -190,7 +203,13 @@ def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, Inlin
             "🎁 <b>Всё на месте — забирайте свои подарки! 👇</b>",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [make_btn("🎁 Забрать подарки", style="danger", web_app=webapp)]
+                    [
+                        make_btn(
+                            "🎁 Забрать подарки",
+                            style="danger",
+                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_3")),
+                        )
+                    ]
                 ]
             ),
         ),
@@ -198,7 +217,13 @@ def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, Inlin
             "⏳ <b>Всё готово — но подарки ждут недолго! 👇</b>",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [make_btn("🎁 Успеть забрать", style="primary", web_app=webapp)]
+                    [
+                        make_btn(
+                            "🎁 Успеть забрать",
+                            style="primary",
+                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_4")),
+                        )
+                    ]
                 ]
             ),
         ),
@@ -529,7 +554,7 @@ def premium_menu_kb(prefix: str = "buy_prem") -> InlineKeyboardMarkup:
 
 
 def shop_webapp_kb(user: dict, bot_username: str = "LarplBot") -> InlineKeyboardMarkup:
-    url = build_shop_webapp_url(user, bot_username)
+    url = build_shop_webapp_url(user, bot_username, "menu_shop")
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1333,7 +1358,13 @@ async def handle_successful_payment(message: Message, bot: Bot):
         spins_cnt = "∞" if is_admin(user_id) else str(int(user.get("fortune_spins") or 1))
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [make_btn("🎰 Открыть Mini App", style="success", web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot")))]
+                [
+                    make_btn(
+                        "🎰 Открыть Mini App",
+                        style="success",
+                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot", "after_spin_pay")),
+                    )
+                ]
             ]
         )
         await message.answer(
@@ -1350,7 +1381,13 @@ async def handle_successful_payment(message: Message, bot: Bot):
         cases_cnt = "∞" if is_admin(user_id) else str(int(user.get("case_opens") or 1))
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [make_btn("📦 Открыть Mini App", style="success", web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot")))]
+                [
+                    make_btn(
+                        "📦 Открыть Mini App",
+                        style="success",
+                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot", "after_case_pay")),
+                    )
+                ]
             ]
         )
         await message.answer(
