@@ -30,7 +30,7 @@ DB_PATH = os.environ.get("DB_PATH", "bot.db")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@LarpLiveChan")
 
 SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
-APP_BUILD_REV = os.environ.get("APP_BUILD_REV", "2026_11_28_v2")
+APP_BUILD_REV = os.environ.get("APP_BUILD_REV", "2026_11_28_v3")
 
 COINS_PER_STAR = 25
 
@@ -125,7 +125,12 @@ def format_premium_status(user: dict) -> str:
     return "Базовый"
 
 
-def build_shop_webapp_url(user: dict, bot_username: str = "LarplBot", source_tag: str = "app") -> str:
+def build_shop_webapp_url(
+    user: dict,
+    bot_username: str = "LarplBot",
+    source_tag: str = "app",
+    target_tab: str | None = None,
+) -> str:
     uid = int(user["user_id"])
     admin_flag = 1 if is_admin(uid) else 0
     has_prem = 1 if is_premium_active(user) else 0
@@ -133,37 +138,43 @@ def build_shop_webapp_url(user: dict, bot_username: str = "LarplBot", source_tag
     cases = ADMIN_INFINITE_COUNT if admin_flag else max(0, int(user.get("case_opens") or 0))
     coins = max(0, int(user.get("coins") or 0))
 
+    query_data = {
+        "user_id": uid,
+        "coins": coins,
+        "rate": COINS_PER_STAR,
+        "has_premium": has_prem,
+        "is_admin": admin_flag,
+        "spins": spins,
+        "cases": cases,
+        "bot": bot_username,
+        "src": source_tag,
+        "rev": APP_BUILD_REV,
+        "v": int(time.time()),
+        "items": json.dumps(
+            [
+                {
+                    "id": k,
+                    "emoji": v["emoji"],
+                    "name": v["name"],
+                    "stars": v["stars"],
+                    "coins": v["coins"],
+                }
+                for k, v in TG_GIFTS.items()
+            ],
+            ensure_ascii=False,
+        ),
+    }
+    if target_tab:
+        query_data["tab"] = target_tab
+        query_data["screen"] = target_tab
+        query_data["page"] = target_tab
+
     base_url = SHOP_WEBAPP_URL.strip()
     sep = "&" if "?" in base_url else "?"
-    params = urlencode(
-        {
-            "user_id": uid,
-            "coins": coins,
-            "rate": COINS_PER_STAR,
-            "has_premium": has_prem,
-            "is_admin": admin_flag,
-            "spins": spins,
-            "cases": cases,
-            "bot": bot_username,
-            "src": source_tag,
-            "rev": APP_BUILD_REV,
-            "v": int(time.time()),
-            "items": json.dumps(
-                [
-                    {
-                        "id": k,
-                        "emoji": v["emoji"],
-                        "name": v["name"],
-                        "stars": v["stars"],
-                        "coins": v["coins"],
-                    }
-                    for k, v in TG_GIFTS.items()
-                ],
-                ensure_ascii=False,
-            ),
-        }
-    )
-    return f"{base_url}{sep}{params}"
+    url = f"{base_url}{sep}{urlencode(query_data)}"
+    if target_tab:
+        url = f"{url}#{target_tab}"
+    return url
 
 
 def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, InlineKeyboardMarkup]]:
@@ -181,7 +192,7 @@ def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, Inlin
                         make_btn(
                             "💎 Выбрать подарок",
                             style="primary",
-                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_1")),
+                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_1", "shop")),
                         )
                     ]
                 ]
@@ -195,7 +206,7 @@ def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, Inlin
                         make_btn(
                             "🎁 Забрать",
                             style="success",
-                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_2")),
+                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_2", "shop")),
                         )
                     ]
                 ]
@@ -209,7 +220,7 @@ def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, Inlin
                         make_btn(
                             "🎁 Забрать подарки",
                             style="danger",
-                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_3")),
+                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_3", "shop")),
                         )
                     ]
                 ]
@@ -223,7 +234,7 @@ def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, Inlin
                         make_btn(
                             "🎁 Успеть забрать",
                             style="primary",
-                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_4")),
+                            web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "promo_4", "shop")),
                         )
                     ]
                 ]
@@ -579,26 +590,36 @@ async def grant_premium(target_user_id: int, tariff_key: str):
         await db.commit()
 
 
-def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
+def main_menu_kb(
+    user: dict | None = None,
+    bot_username: str = "LarplBot",
+    user_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    uid = user_id if user_id is not None else (user.get("user_id") if user else None)
+    profile_user = user or {"user_id": uid or 0, "coins": 0, "fortune_spins": 0, "case_opens": 0}
+
+    cases_url = build_shop_webapp_url(profile_user, bot_username, "menu_cases", target_tab="cases")
+    shop_url = build_shop_webapp_url(profile_user, bot_username, "menu_shop", target_tab="shop")
+
     rows = [
         [
             make_btn("👤 Профиль", style="primary", callback_data="menu:profile"),
             make_btn("🎁 Бонус", style="success", callback_data="menu:bonus"),
         ],
         [
-            make_btn("👥 Рефералка", style="primary", callback_data="menu:ref"),
-            make_btn("🛒 Магазин", style="success", callback_data="menu:shop"),
+            make_btn("📦 Кейс", style="primary", web_app=WebAppInfo(url=cases_url)),
+            make_btn("🛒 Магазин", style="success", web_app=WebAppInfo(url=shop_url)),
         ],
         [
-            make_btn("👑 Премиум", style="primary", callback_data="menu:premium"),
-            make_btn("⚡ VIP-раздел", style="success", callback_data="menu:vip"),
+            make_btn("👥 Рефералка", style="primary", callback_data="menu:ref"),
+            make_btn("👑 Премиум", style="success", callback_data="menu:premium"),
         ],
         [
             make_btn("🎁 Подарок", style="danger", callback_data="menu:gift"),
         ],
     ]
-    if is_admin(user_id):
-        rows.append([make_btn("🛠 Админ-панель", style="danger", callback_data="menu:admin")])
+    if is_admin(uid):
+        rows.append([make_btn("🛠 Админка", style="danger", callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -648,7 +669,7 @@ def premium_menu_kb(prefix: str = "buy_prem") -> InlineKeyboardMarkup:
 
 
 def shop_webapp_kb(user: dict, bot_username: str = "LarplBot") -> InlineKeyboardMarkup:
-    url = build_shop_webapp_url(user, bot_username, "menu_shop")
+    url = build_shop_webapp_url(user, bot_username, "menu_shop", target_tab="shop")
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -722,6 +743,9 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
     if not user:
         return None
 
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username or "LarplBot"
+
     spins_val = "∞" if is_admin(user_id) else str(int(user.get("fortune_spins") or 0))
     cases_val = "∞" if is_admin(user_id) else str(int(user.get("case_opens") or 0))
 
@@ -738,8 +762,7 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
         return text, back_menu_kb(user_id)
 
     if screen == "ref":
-        bot_info = await bot.get_me()
-        ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+        ref_link = f"https://t.me/{bot_username}?start={user_id}"
         text = (
             "👥 <b>Реферальная система</b>\n\n"
             f"За каждого нового друга ты получаешь <b>+{REF_BONUS_COINS} CoinTag</b> (с PREMIUM — x2).\n"
@@ -749,7 +772,6 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
         return text, back_menu_kb(user_id)
 
     if screen == "shop":
-        bot_info = await bot.get_me()
         lines = [
             "🛒 <b>Магазин ТГ-подарков</b>",
             f"Твой баланс: <b>{user['coins']} CoinTag</b>",
@@ -758,7 +780,7 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
         ]
         for item in TG_GIFTS.values():
             lines.append(f"• {item['emoji']} <b>{item['name']}</b> — <b>{item['coins']} CoinTag</b> ({item['stars']} ★)")
-        return "\n".join(lines), shop_webapp_kb(user, bot_info.username or "LarplBot")
+        return "\n".join(lines), shop_webapp_kb(user, bot_username)
 
     if screen == "premium":
         text = (
@@ -767,18 +789,6 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
             "Выбери тариф:"
         )
         return text, premium_menu_kb("buy_prem")
-
-    if screen == "vip":
-        if not is_premium_active(user):
-            return (
-                "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-                main_menu_kb(user_id),
-            )
-        text = (
-            "⚡ <b>VIP-раздел</b>\n\n"
-            "Добро пожаловать в VIP! Здесь доступны эксклюзивные бонусы и привилегии для владельцев PREMIUM."
-        )
-        return text, back_menu_kb(user_id)
 
     if screen == "gift":
         text = (
@@ -792,13 +802,13 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
         if not is_admin(user_id):
             return (
                 "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-                main_menu_kb(user_id),
+                main_menu_kb(user, bot_username, user_id),
             )
         return "🛠 <b>Админ-панель</b>\n\nВыбери действие:", admin_panel_kb()
 
     return (
         "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-        main_menu_kb(user_id),
+        main_menu_kb(user, bot_username, user_id),
     )
 
 
@@ -973,17 +983,21 @@ async def push_update_to_all(bot: Bot) -> tuple[int, int]:
         async with db.execute("SELECT user_id FROM users") as cursor:
             rows = await cursor.fetchall()
 
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username or "LarplBot"
+
     sent = 0
     failed = 0
     for (uid,) in rows:
         try:
+            u = await get_user(uid)
             await send_screen_with_autodel(
                 bot,
                 uid,
                 uid,
                 "main",
                 "🔄 <b>Бот и магазин обновлены!</b>\nЗабирай бонус и заглядывай в <b>Магазин</b> 🛒",
-                main_menu_kb(uid),
+                main_menu_kb(u, bot_username, uid),
             )
             sent += 1
             await asyncio.sleep(0.05)
@@ -994,8 +1008,12 @@ async def push_update_to_all(bot: Bot) -> tuple[int, int]:
 
 async def process_gift_order(message: Message, item_key: str, bot: Bot, charge_coins: bool = True):
     item = TG_GIFTS.get(item_key)
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username or "LarplBot"
+
     if not item:
-        await message.answer("❌ Выбран неизвестный ТГ-подарок.", reply_markup=main_menu_kb(message.from_user.id))
+        u = await get_user(message.from_user.id)
+        await message.answer("❌ Выбран неизвестный ТГ-подарок.", reply_markup=main_menu_kb(u, bot_username, message.from_user.id))
         return
 
     user_id = message.from_user.id
@@ -1010,7 +1028,7 @@ async def process_gift_order(message: Message, item_key: str, bot: Bot, charge_c
             await message.answer(
                 f"❌ Недостаточно CoinTag для вывода <b>{item['emoji']} {item['name']}</b>!\n"
                 f"Нужно: <b>{item['coins']} CoinTag</b> ({item['stars']} ★), у тебя: <b>{current} CoinTag</b>.",
-                reply_markup=main_menu_kb(user_id),
+                reply_markup=main_menu_kb(user, bot_username, user_id),
                 parse_mode="HTML",
             )
             return
@@ -1021,7 +1039,7 @@ async def process_gift_order(message: Message, item_key: str, bot: Bot, charge_c
                 (item["coins"], user_id, item["coins"]),
             )
             if cur.rowcount == 0:
-                await message.answer("❌ Недостаточно CoinTag!", reply_markup=main_menu_kb(user_id))
+                await message.answer("❌ Недостаточно CoinTag!", reply_markup=main_menu_kb(user, bot_username, user_id))
                 return
             await db.execute(
                 """
@@ -1042,6 +1060,7 @@ async def process_gift_order(message: Message, item_key: str, bot: Bot, charge_c
             )
             await db.commit()
 
+    updated_user = await get_user(user_id)
     await send_screen_with_autodel(
         bot,
         user_id,
@@ -1049,7 +1068,7 @@ async def process_gift_order(message: Message, item_key: str, bot: Bot, charge_c
         "main",
         f"✅ Заявка на вывод ТГ-подарка <b>{item['emoji']} {item['name']}</b> оформлена!\n"
         f"Списано: <b>{spent} CoinTag</b>.",
-        main_menu_kb(user_id),
+        main_menu_kb(updated_user, bot_username, user_id),
     )
 
     try:
@@ -1151,6 +1170,10 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
     )
     await cleanup_expired_premiums_db()
 
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username or "LarplBot"
+    user = await get_user(user_id)
+
     if args == "buy_fortune" and not is_admin(user_id):
         await message.answer_invoice(
             title="Крутка колеса фортуны",
@@ -1183,7 +1206,15 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
             recipient_id = int(parts[2])
             amount = int(parts[3])
             ok, msg = await send_coins_gift(user_id, recipient_id, amount, bot)
-            await send_screen_with_autodel(bot, user_id, message.chat.id, "main", msg, main_menu_kb(user_id))
+            u_now = await get_user(user_id)
+            await send_screen_with_autodel(
+                bot,
+                user_id,
+                message.chat.id,
+                "main",
+                msg,
+                main_menu_kb(u_now, bot_username, user_id),
+            )
             return
 
         if len(parts) >= 4 and parts[1] == "prem" and parts[2].isdigit():
@@ -1213,7 +1244,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
         message.chat.id,
         "main",
         "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-        main_menu_kb(user_id),
+        main_menu_kb(user, bot_username, user_id),
     )
 
     restart_user_promo_timer(bot, user_id, send_immediately=True)
@@ -1248,6 +1279,10 @@ async def handle_welcome_spin_callbacks(callback: CallbackQuery, bot: Bot):
         except Exception:
             pass
 
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username or "LarplBot"
+        user = await get_user(user_id)
+
         await callback.answer("🎡 +1 крутка получена!", show_alert=False)
         await send_screen_with_autodel(
             bot,
@@ -1255,7 +1290,7 @@ async def handle_welcome_spin_callbacks(callback: CallbackQuery, bot: Bot):
             callback.message.chat.id,
             "main",
             f"{msg}\n\nЗаглядывай в <b>Магазин</b> 🛒 и крути колесо!",
-            main_menu_kb(user_id),
+            main_menu_kb(user, bot_username, user_id),
         )
 
 
@@ -1277,12 +1312,11 @@ async def handle_menu_callbacks(callback: CallbackQuery):
 
     if action == "main":
         pending_admin_action.pop(user_id, None)
-        await replace_screen_on_callback(
-            callback,
-            "main",
-            "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-            main_menu_kb(user_id),
-        )
+        payload = await build_screen_payload(callback.bot, user_id, "main")
+        if payload:
+            await replace_screen_on_callback(callback, "main", payload[0], payload[1])
+        else:
+            await callback.answer()
         return
 
     if action == "profile":
@@ -1330,18 +1364,6 @@ async def handle_menu_callbacks(callback: CallbackQuery):
         payload = await build_screen_payload(callback.bot, user_id, "premium")
         if payload:
             await replace_screen_on_callback(callback, "premium", payload[0], payload[1])
-        else:
-            await callback.answer()
-        return
-
-    if action == "vip":
-        user = await get_user(user_id)
-        if not is_premium_active(user):
-            await callback.answer("🔒 Этот раздел доступен только владельцам 👑 PREMIUM!", show_alert=True)
-            return
-        payload = await build_screen_payload(callback.bot, user_id, "vip")
-        if payload:
-            await replace_screen_on_callback(callback, "vip", payload[0], payload[1])
         else:
             await callback.answer()
         return
@@ -1500,7 +1522,14 @@ async def handle_gift_coins_amount(callback: CallbackQuery, bot: Bot):
         return
 
     ok, msg = await send_coins_gift(sender_id, recipient_id, amount, bot)
-    await replace_screen_on_callback(callback, "main", msg, main_menu_kb(sender_id))
+    u_now = await get_user(sender_id)
+    bot_info = await bot.get_me()
+    await replace_screen_on_callback(
+        callback,
+        "main",
+        msg,
+        main_menu_kb(u_now, bot_username=bot_info.username or "LarplBot", user_id=sender_id),
+    )
 
 
 async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery):
@@ -1515,11 +1544,12 @@ async def handle_successful_payment(message: Message, bot: Bot):
     user_id = message.from_user.id
     payload = sp.invoice_payload or ""
     parts = payload.split(":")
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username or "LarplBot"
 
     if payload == "buy_fortune_spin":
         await add_fortune_spins(user_id, 1)
         user = await get_user(user_id)
-        bot_info = await bot.get_me()
         spins_cnt = "∞" if is_admin(user_id) else str(int(user.get("fortune_spins") or 1))
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1527,7 +1557,7 @@ async def handle_successful_payment(message: Message, bot: Bot):
                     make_btn(
                         "🎰 Открыть Mini App",
                         style="success",
-                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot", "after_spin_pay")),
+                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "after_spin_pay", "wheel")),
                     )
                 ]
             ]
@@ -1542,7 +1572,6 @@ async def handle_successful_payment(message: Message, bot: Bot):
     if payload == "buy_case_open":
         await add_case_opens(user_id, 1)
         user = await get_user(user_id)
-        bot_info = await bot.get_me()
         cases_cnt = "∞" if is_admin(user_id) else str(int(user.get("case_opens") or 1))
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1550,7 +1579,7 @@ async def handle_successful_payment(message: Message, bot: Bot):
                     make_btn(
                         "📦 Открыть Mini App",
                         style="success",
-                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot", "after_case_pay")),
+                        web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_username, "after_case_pay", "cases")),
                     )
                 ]
             ]
@@ -1565,9 +1594,10 @@ async def handle_successful_payment(message: Message, bot: Bot):
     if len(parts) == 2 and parts[0] == "buy_prem" and parts[1] in PREMIUM_TARIFFS:
         tariff_key = parts[1]
         await grant_premium(user_id, tariff_key)
+        u_now = await get_user(user_id)
         await message.answer(
             f"👑 Оплата прошла! Тебе активирован <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b>.",
-            reply_markup=main_menu_kb(user_id),
+            reply_markup=main_menu_kb(u_now, bot_username, user_id),
             parse_mode="HTML",
         )
         return
@@ -1576,9 +1606,10 @@ async def handle_successful_payment(message: Message, bot: Bot):
         recipient_id = int(parts[1])
         tariff_key = parts[2]
         await grant_premium(recipient_id, tariff_key)
+        u_now = await get_user(user_id)
         await message.answer(
             f"🎁 Подарок <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> отправлен пользователю <code>{recipient_id}</code>!",
-            reply_markup=main_menu_kb(user_id),
+            reply_markup=main_menu_kb(u_now, bot_username, user_id),
             parse_mode="HTML",
         )
         try:
@@ -1839,6 +1870,8 @@ async def handle_text_messages(message: Message, bot: Bot):
     if message.text and message.text.strip() == "❌ Отмена":
         pending_gift_state.pop(message.from_user.id, None)
         pending_admin_action.pop(message.from_user.id, None)
+        bot_info = await bot.get_me()
+        u_now = await get_user(message.from_user.id)
         await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
         await send_screen_with_autodel(
             bot,
@@ -1846,7 +1879,7 @@ async def handle_text_messages(message: Message, bot: Bot):
             message.chat.id,
             "main",
             "Добро пожаловать! Выбирай нужный раздел кнопками ниже:",
-            main_menu_kb(message.from_user.id),
+            main_menu_kb(u_now, bot_username=bot_info.username or "LarplBot", user_id=message.from_user.id),
         )
         return
 
