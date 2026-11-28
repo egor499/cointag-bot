@@ -27,13 +27,17 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
-# Ссылка на твоё веб-приложение (Mini App) магазина (обязательно https://)
 SHOP_WEBAPP_URL = os.environ.get("SHOP_WEBAPP_URL", "https://egor499.github.io/cointag-shop/")
 
-# Курс: 1 звезда = 25 коинов
 COINS_PER_STAR = 25
 
-# Тарифы премиума (используются и для покупки себе, и для подарка другу за звёзды)
+FORTUNE_SPIN_STARS = 10
+CASE_OPEN_STARS = 15
+
+ALLOWED_FORTUNE_COINS = {25, 50}
+ALLOWED_CASE_COINS = {30, 50, 500}
+PROMO_SUPER_COINS = 10
+
 PREMIUM_TARIFFS = {
     "1d": {"title": "Премиум на 1 день", "stars": 3, "seconds": 86400},
     "7d": {"title": "Премиум на 7 дней", "stars": 18, "seconds": 7 * 86400},
@@ -41,8 +45,6 @@ PREMIUM_TARIFFS = {
     "forever": {"title": "Премиум НАВСЕГДА (УЛЬТРА СКИДКА)", "stars": 149, "seconds": None},
 }
 
-# ТГ-подарки магазина вывода:
-# мишка = 300 коинов (15 зв), сердечко = 500 коинов (25 зв), колечко = 1500 коинов (100 зв)
 TG_GIFTS = {
     "bear": {
         "name": "Мишка",
@@ -69,27 +71,24 @@ BONUS_COINS = 5
 BONUS_COOLDOWN = 86400
 REF_BONUS_COINS = 15
 AUTO_DELETE_SECONDS = 60
-PROMO_INTERVAL_SECONDS = 2 * 3600  # 2 часа (7200 секунд)
-PROMO_DELETE_SECONDS = 4 * 3600    # 4 часа (14400 секунд)
+PROMO_INTERVAL_SECONDS = 2 * 3600
+PROMO_DELETE_SECONDS = 4 * 3600
 
-# Временное состояние для выбора подарка / суммы / действий админа
 pending_gift_state: dict[int, dict] = {}
 pending_admin_action: dict[int, str] = {}
 
-# Кэш активного экрана и активные таймеры автоудаления/автообновления на пользователя
 active_screen_cache: dict[int, dict] = {}
 autodel_tasks: dict[int, asyncio.Task] = {}
 
-# Персональные 2-часовые циклы промо-рассылки на пользователя
 user_promo_loop_tasks: dict[int, asyncio.Task] = {}
-
-# Кэш и таймеры автоудаления промо-сообщений (удаляются через 4 часа без переоткрытия)
 active_promo_cache: dict[tuple[int, int], dict] = {}
 promo_autodel_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
+# Одноразовые ключи начисления дропа (чтобы нельзя было повторно прокликать старую ссылку claim_)
+pending_reward_claims: dict[tuple[int, str], dict] = {}
+
 
 def make_btn(text: str, style: str | None = None, **kwargs) -> InlineKeyboardButton:
-    """Создаёт InlineKeyboardButton с цветом ('success', 'primary', 'danger' или None)."""
     if style:
         try:
             return InlineKeyboardButton(text=text, style=style, **kwargs)
@@ -102,13 +101,40 @@ def is_admin(user_id: int | None) -> bool:
     return bool(user_id is not None and int(user_id) == ADMIN_ID)
 
 
-def build_shop_webapp_url(user_id: int, coins: int, bot_username: str = "LarplBot") -> str:
+def is_premium_active(user: dict | None) -> bool:
+    if not user:
+        return False
+    if user.get("premium_forever"):
+        return True
+    now_ts = int(time.time())
+    return bool(user.get("premium_until") and user["premium_until"] > now_ts)
+
+
+def format_premium_status(user: dict) -> str:
+    if user.get("premium_forever"):
+        return "PREMIUM НАВСЕГДА 👑"
+    now_ts = int(time.time())
+    if user.get("premium_until") and user["premium_until"] > now_ts:
+        dt = datetime.fromtimestamp(user["premium_until"], tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        return f"PREMIUM до {dt} 👑"
+    return "Базовый"
+
+
+def build_shop_webapp_url(user: dict, bot_username: str = "LarplBot") -> str:
+    has_prem = 1 if is_premium_active(user) else 0
+    spins = int(user.get("fortune_spins") or 0)
+    cases = int(user.get("case_opens") or 0)
+    coins = int(user.get("coins") or 0)
+
     sep = "&" if "?" in SHOP_WEBAPP_URL else "?"
     params = urlencode(
         {
-            "user_id": user_id,
+            "user_id": user["user_id"],
             "coins": coins,
             "rate": COINS_PER_STAR,
+            "has_premium": has_prem,
+            "spins": spins,
+            "cases": cases,
             "bot": bot_username,
             "v": int(time.time()),
             "items": json.dumps(
@@ -129,8 +155,8 @@ def build_shop_webapp_url(user_id: int, coins: int, bot_username: str = "LarplBo
     return f"{SHOP_WEBAPP_URL}{sep}{params}"
 
 
-def build_promo_messages(user_id: int, coins: int, bot_username: str) -> list[tuple[str, InlineKeyboardMarkup]]:
-    shop_url = build_shop_webapp_url(user_id, coins, bot_username)
+def build_promo_messages(user: dict, bot_username: str) -> list[tuple[str, InlineKeyboardMarkup]]:
+    shop_url = build_shop_webapp_url(user, bot_username)
     webapp = WebAppInfo(url=shop_url)
 
     return [
@@ -138,7 +164,7 @@ def build_promo_messages(user_id: int, coins: int, bot_username: str) -> list[tu
             "🎁 <b>Выбирай, какой подарок хочешь 👇</b>\n\n"
             "<blockquote>"
             "🧸 Мишка\n"
-            "🪙 100 коинов\n"
+            "🪙 100 CoinTag\n"
             "👑 7 дней бесплатного премиум в боте"
             "</blockquote>",
             InlineKeyboardMarkup(
@@ -190,7 +216,9 @@ async def init_db():
                 premium_forever INTEGER DEFAULT 0,
                 last_bonus INTEGER DEFAULT 0,
                 referrer_id INTEGER,
-                referrals_count INTEGER DEFAULT 0
+                referrals_count INTEGER DEFAULT 0,
+                fortune_spins INTEGER DEFAULT 0,
+                case_opens INTEGER DEFAULT 0
             )
             """
         )
@@ -206,6 +234,13 @@ async def init_db():
             )
             """
         )
+        # Миграция для существующей таблицы users
+        cursor = await db.execute("PRAGMA table_info(users)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "fortune_spins" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN fortune_spins INTEGER DEFAULT 0")
+        if "case_opens" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN case_opens INTEGER DEFAULT 0")
         await db.commit()
 
 
@@ -310,23 +345,22 @@ async def add_coins(target_user_id: int, delta: int):
         await db.commit()
 
 
-def is_premium_active(user: dict) -> bool:
-    if not user:
-        return False
-    if user.get("premium_forever"):
-        return True
-    now_ts = int(time.time())
-    return bool(user.get("premium_until") and user["premium_until"] > now_ts)
+async def add_fortune_spins(user_id: int, count: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET fortune_spins = COALESCE(fortune_spins, 0) + ? WHERE user_id = ?",
+            (count, user_id),
+        )
+        await db.commit()
 
 
-def format_premium_status(user: dict) -> str:
-    if user.get("premium_forever"):
-        return "PREMIUM НАВСЕГДА 👑"
-    now_ts = int(time.time())
-    if user.get("premium_until") and user["premium_until"] > now_ts:
-        dt = datetime.fromtimestamp(user["premium_until"], tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-        return f"PREMIUM до {dt} 👑"
-    return "Базовый"
+async def add_case_opens(user_id: int, count: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET case_opens = COALESCE(case_opens, 0) + ? WHERE user_id = ?",
+            (count, user_id),
+        )
+        await db.commit()
 
 
 async def grant_premium(target_user_id: int, tariff_key: str):
@@ -429,13 +463,13 @@ def premium_menu_kb(prefix: str = "buy_prem") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def shop_webapp_kb(user_id: int, coins: int, bot_username: str = "LarplBot") -> InlineKeyboardMarkup:
-    url = build_shop_webapp_url(user_id, coins, bot_username)
+def shop_webapp_kb(user: dict, bot_username: str = "LarplBot") -> InlineKeyboardMarkup:
+    url = build_shop_webapp_url(user, bot_username)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 make_btn(
-                    "🛍 Открыть магазин подарков",
+                    "🛍 Открыть Mini App",
                     style="success",
                     web_app=WebAppInfo(url=url),
                 )
@@ -448,7 +482,7 @@ def shop_webapp_kb(user_id: int, coins: int, bot_username: str = "LarplBot") -> 
 def gift_type_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [make_btn("🪙 Подарить КоинТэг", style="primary", callback_data="gift_mode:coins")],
+            [make_btn("🪙 Подарить CoinTag", style="primary", callback_data="gift_mode:coins")],
             [make_btn("👑 Подарить Премиум (★)", style="success", callback_data="gift_mode:premium")],
             [make_btn("⬅️ В меню", style="danger", callback_data="menu:main")],
         ]
@@ -481,7 +515,7 @@ def gift_coins_amounts_kb() -> InlineKeyboardMarkup:
         rows.append(
             [
                 make_btn(
-                    f"Подарить {amt} КоинТэг",
+                    f"Подарить {amt} CoinTag",
                     style="success",
                     callback_data=f"gift_coins_amt:{amt}",
                 )
@@ -509,7 +543,9 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
             "👤 <b>Твой профиль</b>\n\n"
             f"🆔 ID: <code>{user['user_id']}</code>\n"
             f"🏅 Статус: <b>{format_premium_status(user)}</b>\n"
-            f"🪙 Баланс: <b>{user['coins']} КоинТэг</b>\n"
+            f"🪙 Баланс: <b>{user['coins']} CoinTag</b>\n"
+            f"🎡 Круток фортуны: <b>{user.get('fortune_spins') or 0}</b>\n"
+            f"📦 Открытий кейса: <b>{user.get('case_opens') or 0}</b>\n"
             f"👥 Приглашено друзей: <b>{user['referrals_count']}</b>"
         )
         return text, back_menu_kb(user_id)
@@ -519,7 +555,7 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
         ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
         text = (
             "👥 <b>Реферальная система</b>\n\n"
-            f"За каждого нового друга ты получаешь <b>+{REF_BONUS_COINS} КоинТэг</b> (с PREMIUM — x2).\n"
+            f"За каждого нового друга ты получаешь <b>+{REF_BONUS_COINS} CoinTag</b> (с PREMIUM — x2).\n"
             f"Приглашено друзей: <b>{user['referrals_count']}</b>\n\n"
             f"Твоя ссылка:\n{ref_link}"
         )
@@ -529,13 +565,13 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
         bot_info = await bot.get_me()
         lines = [
             "🛒 <b>Магазин ТГ-подарков</b>",
-            f"Твой баланс: <b>{user['coins']} КоинТэг</b>",
-            f"Курс вывода: <b>1 ★ = {COINS_PER_STAR} КоинТэг</b>\n",
+            f"Твой баланс: <b>{user['coins']} CoinTag</b>",
+            f"Курс вывода: <b>1 ★ = {COINS_PER_STAR} CoinTag</b>\n",
             "Доступные подарки к выводу:",
         ]
         for item in TG_GIFTS.values():
-            lines.append(f"• {item['emoji']} <b>{item['name']}</b> — <b>{item['coins']} КоинТэг</b> ({item['stars']} ★)")
-        return "\n".join(lines), shop_webapp_kb(user_id, user["coins"], bot_info.username or "LarplBot")
+            lines.append(f"• {item['emoji']} <b>{item['name']}</b> — <b>{item['coins']} CoinTag</b> ({item['stars']} ★)")
+        return "\n".join(lines), shop_webapp_kb(user, bot_info.username or "LarplBot")
 
     if screen == "premium":
         text = (
@@ -560,7 +596,7 @@ async def build_screen_payload(bot: Bot, user_id: int, screen: str) -> tuple[str
     if screen == "gift":
         text = (
             "🎁 <b>Раздел «Подарок»</b>\n"
-            f"Твой текущий баланс: <b>{user['coins']} КоинТэг</b>\n\n"
+            f"Твой текущий баланс: <b>{user['coins']} CoinTag</b>\n\n"
             "Что хочешь подарить пользователю из контактов?"
         )
         return text, gift_type_kb()
@@ -636,12 +672,13 @@ async def _promo_autodel_worker(bot: Bot, chat_id: int, message_id: int):
 
 async def send_one_random_promo(bot: Bot, user_id: int):
     try:
+        await cleanup_expired_premiums_db()
         user = await get_user(user_id)
         if not user:
             return
         bot_info = await bot.get_me()
         bot_username = bot_info.username or "LarplBot"
-        variants = build_promo_messages(user_id, user.get("coins") or 0, bot_username)
+        variants = build_promo_messages(user, bot_username)
         text, kb = random.choice(variants)
 
         msg = await bot.send_message(
@@ -768,7 +805,7 @@ async def push_update_to_all(bot: Bot) -> tuple[int, int]:
     return sent, failed
 
 
-async def process_gift_order(message: Message, item_key: str, bot: Bot):
+async def process_gift_order(message: Message, item_key: str, bot: Bot, charge_coins: bool = True):
     item = TG_GIFTS.get(item_key)
     if not item:
         await message.answer("❌ Выбран неизвестный ТГ-подарок.", reply_markup=main_menu_kb(message.from_user.id))
@@ -778,47 +815,63 @@ async def process_gift_order(message: Message, item_key: str, bot: Bot):
     await ensure_user(user_id, message.from_user.username, message.from_user.full_name)
     user = await get_user(user_id)
 
-    if not user or user["coins"] < item["coins"]:
-        current = user["coins"] if user else 0
-        await message.answer(
-            f"❌ Недостаточно КоинТэг для вывода <b>{item['emoji']} {item['name']}</b>!\n"
-            f"Нужно: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★), у тебя: <b>{current} КоинТэг</b>.",
-            reply_markup=main_menu_kb(user_id),
-            parse_mode="HTML",
-        )
-        return
+    spent = item["coins"] if charge_coins else 0
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE users SET coins = coins - ? WHERE user_id = ? AND coins >= ?",
-            (item["coins"], user_id, item["coins"]),
-        )
-        if cur.rowcount == 0:
-            await message.answer("❌ Недостаточно КоинТэг!", reply_markup=main_menu_kb(user_id))
+    if charge_coins:
+        if not user or user["coins"] < item["coins"]:
+            current = user["coins"] if user else 0
+            await message.answer(
+                f"❌ Недостаточно CoinTag для вывода <b>{item['emoji']} {item['name']}</b>!\n"
+                f"Нужно: <b>{item['coins']} CoinTag</b> ({item['stars']} ★), у тебя: <b>{current} CoinTag</b>.",
+                reply_markup=main_menu_kb(user_id),
+                parse_mode="HTML",
+            )
             return
-        await db.execute(
-            """
-            INSERT INTO shop_orders (user_id, item_key, coins_spent, status, created_at)
-            VALUES (?, ?, ?, 'pending', ?)
-            """,
-            (user_id, item_key, item["coins"], int(time.time())),
-        )
-        await db.commit()
 
-    await message.answer(
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "UPDATE users SET coins = coins - ? WHERE user_id = ? AND coins >= ?",
+                (item["coins"], user_id, item["coins"]),
+            )
+            if cur.rowcount == 0:
+                await message.answer("❌ Недостаточно CoinTag!", reply_markup=main_menu_kb(user_id))
+                return
+            await db.execute(
+                """
+                INSERT INTO shop_orders (user_id, item_key, coins_spent, status, created_at)
+                VALUES (?, ?, ?, 'pending', ?)
+                """,
+                (user_id, item_key, item["coins"], int(time.time())),
+            )
+            await db.commit()
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO shop_orders (user_id, item_key, coins_spent, status, created_at)
+                VALUES (?, ?, 0, 'pending', ?)
+                """,
+                (user_id, item_key, int(time.time())),
+            )
+            await db.commit()
+
+    await send_screen_with_autodel(
+        bot,
+        user_id,
+        message.chat.id,
+        "main",
         f"✅ Заявка на вывод ТГ-подарка <b>{item['emoji']} {item['name']}</b> оформлена!\n"
-        f"Списано: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★).",
-        reply_markup=main_menu_kb(user_id),
-        parse_mode="HTML",
+        f"Списано: <b>{spent} CoinTag</b>.",
+        main_menu_kb(user_id),
     )
 
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"🛍 Новый вывод ТГ-подарка через Mini App:\n"
+            f"🛍 Новая заявка на вывод ТГ-подарка:\n"
             f"Пользователь: <code>{user_id}</code> (@{message.from_user.username or 'без_юзернейма'})\n"
             f"Подарок: {item['emoji']} {item['name']}\n"
-            f"Списано: <b>{item['coins']} КоинТэг</b> ({item['stars']} ★)",
+            f"Списано: <b>{spent} CoinTag</b> ({item['stars']} ★)",
             parse_mode="HTML",
         )
     except Exception:
@@ -862,7 +915,7 @@ async def show_gift_menu(callback: CallbackQuery):
 
 async def send_coins_gift(sender_id: int, recipient_id: int, amount: int, bot: Bot) -> tuple[bool, str]:
     if recipient_id == sender_id:
-        return False, "❌ Нельзя подарить КоинТэг самому себе."
+        return False, "❌ Нельзя подарить CoinTag самому себе."
     if amount <= 0:
         return False, "❌ Некорректная сумма подарка."
     if not await user_exists(recipient_id):
@@ -871,7 +924,7 @@ async def send_coins_gift(sender_id: int, recipient_id: int, amount: int, bot: B
     sender = await get_user(sender_id)
     if not sender or sender["coins"] < amount:
         current = sender["coins"] if sender else 0
-        return False, f"❌ Недостаточно КоинТэг! Нужно <b>{amount}</b>, а у тебя <b>{current}</b>."
+        return False, f"❌ Недостаточно CoinTag! Нужно <b>{amount}</b>, а у тебя <b>{current}</b>."
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -879,7 +932,7 @@ async def send_coins_gift(sender_id: int, recipient_id: int, amount: int, bot: B
             (amount, sender_id, amount),
         )
         if cur.rowcount == 0:
-            return False, "❌ Недостаточно КоинТэг для отправки подарка."
+            return False, "❌ Недостаточно CoinTag для отправки подарка."
         await db.execute(
             "UPDATE users SET coins = coins + ? WHERE user_id = ?",
             (amount, recipient_id),
@@ -889,20 +942,19 @@ async def send_coins_gift(sender_id: int, recipient_id: int, amount: int, bot: B
     try:
         await bot.send_message(
             recipient_id,
-            f"🎁 Тебе подарили <b>{amount} КоинТэг</b> от пользователя <code>{sender_id}</code>!",
+            f"🎁 Тебе подарили <b>{amount} CoinTag</b> от пользователя <code>{sender_id}</code>!",
             parse_mode="HTML",
         )
     except Exception:
         pass
 
-    return True, f"🎁 Ты успешно подарил <b>{amount} КоинТэг</b> пользователю <code>{recipient_id}</code>!"
+    return True, f"🎁 Ты успешно подарил <b>{amount} CoinTag</b> пользователю <code>{recipient_id}</code>!"
 
 
 async def handle_start(message: Message, command: CommandObject, bot: Bot):
     user_id = message.from_user.id
-    ref_id = None
-    if command.args and command.args.isdigit():
-        ref_id = int(command.args)
+    args = (command.args or "").strip()
+    ref_id = int(args) if args.isdigit() else None
 
     await ensure_user(
         user_id,
@@ -910,23 +962,73 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
         message.from_user.full_name,
         referrer_id=ref_id,
     )
+    await cleanup_expired_premiums_db()
 
-    if command.args and command.args.startswith("shop_"):
-        if user_id not in user_promo_loop_tasks:
-            restart_user_promo_timer(bot, user_id, send_immediately=False)
-        item_key = command.args.removeprefix("shop_")
-        await process_gift_order(message, item_key, bot)
+    if args == "buy_fortune":
+        await message.answer_invoice(
+            title="Крутка колеса фортуны",
+            description="Покупка 1 крутки колеса фортуны в CoinTag Mini App",
+            payload="buy_fortune_spin",
+            currency="XTR",
+            prices=[LabeledPrice(label="Крутка фортуны", amount=FORTUNE_SPIN_STARS)],
+        )
         return
 
-    if command.args and command.args.startswith("gift_"):
-        if user_id not in user_promo_loop_tasks:
-            restart_user_promo_timer(bot, user_id, send_immediately=False)
-        parts = command.args.split("_")
+    if args == "buy_case":
+        await message.answer_invoice(
+            title="Обычный кейс",
+            description="Покупка 1 открытия обычного кейса в CoinTag Mini App",
+            payload="buy_case_open",
+            currency="XTR",
+            prices=[LabeledPrice(label="Обычный кейс", amount=CASE_OPEN_STARS)],
+        )
+        return
+
+    if args.startswith("claim_coins_"):
+        # Формат: claim_coins_<AMOUNT>_from_<source>
+        parts = args.split("_")
+        if len(parts) >= 5 and parts[2].isdigit():
+            amount = int(parts[2])
+            source = "_".join(parts[4:])
+            allowed = False
+            if source == "fortune" and amount in ALLOWED_FORTUNE_COINS:
+                allowed = True
+            elif source == "case" and amount in ALLOWED_CASE_COINS:
+                allowed = True
+            elif source == "promo" and amount == PROMO_SUPER_COINS:
+                allowed = True
+
+            if allowed:
+                await add_coins(user_id, amount)
+                updated = await get_user(user_id)
+                await send_screen_with_autodel(
+                    bot,
+                    user_id,
+                    message.chat.id,
+                    "main",
+                    f"🪙 Получено <b>{amount} CoinTag</b>!\nТекущий баланс: <b>{updated['coins']} CoinTag</b>.",
+                    main_menu_kb(user_id),
+                )
+                return
+
+    if args.startswith("claim_bear_from_"):
+        source = args.removeprefix("claim_bear_from_")
+        if source in ("fortune", "case"):
+            await process_gift_order(message, "bear", bot, charge_coins=False)
+            return
+
+    if args.startswith("shop_"):
+        item_key = args.removeprefix("shop_")
+        await process_gift_order(message, item_key, bot, charge_coins=True)
+        return
+
+    if args.startswith("gift_"):
+        parts = args.split("_")
         if len(parts) >= 4 and parts[1] == "coins" and parts[2].isdigit() and parts[3].isdigit():
             recipient_id = int(parts[2])
             amount = int(parts[3])
             ok, msg = await send_coins_gift(user_id, recipient_id, amount, bot)
-            await message.answer(msg, reply_markup=main_menu_kb(user_id), parse_mode="HTML")
+            await send_screen_with_autodel(bot, user_id, message.chat.id, "main", msg, main_menu_kb(user_id))
             return
 
         if len(parts) >= 4 and parts[1] == "prem" and parts[2].isdigit():
@@ -952,7 +1054,6 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot):
         main_menu_kb(user_id),
     )
 
-    # При /start сразу отправляем 1 рандомное промо-сообщение и запускаем таймер 2 часов заново
     restart_user_promo_timer(bot, user_id, send_immediately=True)
 
 
@@ -1007,7 +1108,7 @@ async def handle_menu_callbacks(callback: CallbackQuery):
                 (BONUS_COINS, now_ts, user_id),
             )
             await db.commit()
-        await callback.answer(f"🎁 Получено +{BONUS_COINS} КоинТэг!", show_alert=True)
+        await callback.answer(f"🎁 Получено +{BONUS_COINS} CoinTag!", show_alert=True)
         await show_profile(callback)
         return
 
@@ -1079,7 +1180,7 @@ async def handle_admin_callbacks(callback: CallbackQuery, bot: Bot):
         text = (
             "📊 <b>Статистика бота</b>\n\n"
             f"👥 Пользователей: <b>{users_cnt}</b>\n"
-            f"🪙 Всего КоинТэг на балансах: <b>{total_coins}</b>\n"
+            f"🪙 Всего CoinTag на балансах: <b>{total_coins}</b>\n"
             f"🛍 Заявок на вывод в ожидании: <b>{pending_orders}</b>"
         )
         await callback.message.edit_text(text, reply_markup=admin_panel_kb(), parse_mode="HTML")
@@ -1099,7 +1200,7 @@ async def handle_admin_callbacks(callback: CallbackQuery, bot: Bot):
     if sub == "coins":
         pending_admin_action[uid] = "coins"
         await callback.message.edit_text(
-            "🪙 <b>Начисление / списание КоинТэг</b>\n\n"
+            "🪙 <b>Начисление / списание CoinTag</b>\n\n"
             "Отправь сообщение в формате:\n<code>USER_ID СУММА</code>\n"
             "Например: <code>123456789 500</code> или <code>123456789 -200</code>",
             reply_markup=admin_panel_kb(),
@@ -1185,15 +1286,50 @@ async def handle_successful_payment(message: Message, bot: Bot):
     if not sp:
         return
 
+    user_id = message.from_user.id
     payload = sp.invoice_payload or ""
     parts = payload.split(":")
 
+    if payload == "buy_fortune_spin":
+        await add_fortune_spins(user_id, 1)
+        user = await get_user(user_id)
+        bot_info = await bot.get_me()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [make_btn("🎰 Открыть Mini App", style="success", web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot")))]
+            ]
+        )
+        await message.answer(
+            f"✅ Оплата прошла! Начислена <b>1 крутка</b> колеса фортуны (доступно: <b>{user.get('fortune_spins') or 1}</b>).\n"
+            "Нажми кнопку ниже и запусти открытие вручную.",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        return
+
+    if payload == "buy_case_open":
+        await add_case_opens(user_id, 1)
+        user = await get_user(user_id)
+        bot_info = await bot.get_me()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [make_btn("📦 Открыть Mini App", style="success", web_app=WebAppInfo(url=build_shop_webapp_url(user, bot_info.username or "LarplBot")))]
+            ]
+        )
+        await message.answer(
+            f"✅ Оплата прошла! Начислено <b>1 открытие</b> обычного кейса (доступно: <b>{user.get('case_opens') or 1}</b>).\n"
+            "Нажми кнопку ниже и запусти открытие вручную.",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        return
+
     if len(parts) == 2 and parts[0] == "buy_prem" and parts[1] in PREMIUM_TARIFFS:
         tariff_key = parts[1]
-        await grant_premium(message.from_user.id, tariff_key)
+        await grant_premium(user_id, tariff_key)
         await message.answer(
             f"👑 Оплата прошла! Тебе активирован <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b>.",
-            reply_markup=main_menu_kb(message.from_user.id),
+            reply_markup=main_menu_kb(user_id),
             parse_mode="HTML",
         )
         return
@@ -1204,13 +1340,13 @@ async def handle_successful_payment(message: Message, bot: Bot):
         await grant_premium(recipient_id, tariff_key)
         await message.answer(
             f"🎁 Подарок <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> отправлен пользователю <code>{recipient_id}</code>!",
-            reply_markup=main_menu_kb(message.from_user.id),
+            reply_markup=main_menu_kb(user_id),
             parse_mode="HTML",
         )
         try:
             await bot.send_message(
                 recipient_id,
-                f"👑 Тебе подарили <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> от пользователя <code>{message.from_user.id}</code>!",
+                f"👑 Тебе подарили <b>{PREMIUM_TARIFFS[tariff_key]['title']}</b> от пользователя <code>{user_id}</code>!",
                 parse_mode="HTML",
             )
         except Exception:
@@ -1242,14 +1378,14 @@ async def handle_admin_text_input(message: Message, bot: Bot) -> bool:
         await add_coins(target_id, delta)
         updated = await get_user(target_id)
         await message.answer(
-            f"✅ Баланс <code>{target_id}</code> изменён на <b>{delta:+d}</b>. Текущий баланс: <b>{updated['coins']} КоинТэг</b>.",
+            f"✅ Баланс <code>{target_id}</code> изменён на <b>{delta:+d}</b>. Текущий баланс: <b>{updated['coins']} CoinTag</b>.",
             reply_markup=admin_panel_kb(),
             parse_mode="HTML",
         )
         try:
             await bot.send_message(
                 target_id,
-                f"🪙 Администратор обновил твой баланс на <b>{delta:+d} КоинТэг</b>!",
+                f"🪙 Администратор обновил твой баланс на <b>{delta:+d} CoinTag</b>!",
                 parse_mode="HTML",
             )
         except Exception:
@@ -1294,7 +1430,8 @@ async def handle_webapp_data(message: Message, bot: Bot):
         return
 
     item_key = payload.get("item_id") or payload.get("item")
-    await process_gift_order(message, item_key, bot)
+    if item_key:
+        await process_gift_order(message, item_key, bot, charge_coins=True)
 
 
 async def handle_gift_mode(callback: CallbackQuery):
@@ -1306,17 +1443,17 @@ async def handle_gift_mode(callback: CallbackQuery):
     pending_gift_state[user_id] = {"mode": mode}
 
     if mode == "coins":
-        label = "📇 Выбрать контакт для подарка КоинТэг"
+        label = "📇 Выбрать контакт для подарка CoinTag"
         info_text = (
-            f"🪙 <b>Подарок КоинТэг</b>\n"
-            f"Твой баланс: <b>{user['coins']} КоинТэг</b>\n\n"
+            f"🪙 <b>Подарок CoinTag</b>\n"
+            f"Твой баланс: <b>{user['coins']} CoinTag</b>\n\n"
             "Нажми кнопку внизу, чтобы выбрать пользователя из контактов."
         )
     else:
         label = "📇 Выбрать контакт для подарка Премиум"
         info_text = (
             f"👑 <b>Подарок Премиум (★)</b>\n"
-            f"Твой баланс: <b>{user['coins']} КоинТэг</b>\n\n"
+            f"Твой баланс: <b>{user['coins']} CoinTag</b>\n\n"
             "Нажми кнопку внизу, чтобы выбрать пользователя из контактов."
         )
 
@@ -1349,7 +1486,7 @@ async def handle_users_shared(message: Message):
         )
     else:
         await message.answer(
-            f"🪙 Выбери сумму КоинТэг для подарка пользователю <code>{recipient_id}</code>:",
+            f"🪙 Выбери сумму CoinTag для подарка пользователю <code>{recipient_id}</code>:",
             reply_markup=gift_coins_amounts_kb(),
             parse_mode="HTML",
         )
